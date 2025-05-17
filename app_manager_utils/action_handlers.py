@@ -12,7 +12,9 @@ import time, math
 from .file_operations import (
     find_similar_images_core,
     consolidate_media_core,
-    organize_media_by_date_core
+    organize_media_by_date_core,
+    separate_files_core, # New import
+    is_likely_screenshot_or_downloaded # New import
 )
 # Constants can be imported if needed
 # from constants import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS
@@ -74,7 +76,8 @@ def handle_delete_items(app_instance, items_to_delete_override=None, from_viewer
 
     if deleted_for_undo:
         app_instance._add_to_undo_stack('delete_items', items=deleted_for_undo)
-        _manage_trash_size(app_instance.TRASH_DIR) # Manage trash size after adding to undo
+        if TRASH_MAX_ITEMS > 0: # Only manage trash size if it's limited
+            _manage_trash_size(app_instance.TRASH_DIR) # Manage trash size after adding to undo
 
     if not from_viewer:
         if items_visually_removed:
@@ -102,12 +105,10 @@ def _manage_trash_size(trash_dir_path):
     Ensures the trash directory doesn't exceed TRASH_MAX_ITEMS.
     Deletes the oldest items if the limit is surpassed.
     Files in trash are expected to be named "timestamp_originalname".
+    Only active if TRASH_MAX_ITEMS > 0.
     """
-    if TRASH_MAX_ITEMS <= 0: # If limit is 0 or less, effectively no trash retention beyond current op
-        # This part could be enhanced to delete all if TRASH_MAX_ITEMS is 0
-        # For now, a positive TRASH_MAX_ITEMS is assumed for FIFO behavior.
-        # If TRASH_MAX_ITEMS is 0, all items will be deleted by num_to_delete logic anyway.
-        pass
+    if TRASH_MAX_ITEMS <= 0: # If limit is 0 or less (unlimited), do nothing.
+        return
 
     try:
         trashed_files_with_ts = []
@@ -151,11 +152,11 @@ def handle_undo_action(app_instance):
                     shutil.move(trashed_path, original_path)
                     restored_count += 1
                 else:
-                    print(f"Undo warning: Trashed file {trashed_path} not found. May have been permanently deleted by trash management.")
+                    print(f"Undo warning: Trashed file {trashed_path} not found. May have been permanently deleted by trash management or app closure.")
             if restored_count > 0:
                 messagebox.showinfo("Undo", f"Restored {restored_count} item(s).", parent=app_instance.root)
             elif last_action['items']: # Items were expected but none restored
-                messagebox.showwarning("Undo Failed", "Could not restore items. They may have been permanently deleted from the trash.", parent=app_instance.root)
+                messagebox.showwarning("Undo Failed", "Could not restore items. They may have been permanently deleted from the trash or by app closure.", parent=app_instance.root)
     except Exception as e:
         messagebox.showerror("Undo Error", f"Could not undo: {e}", parent=app_instance.root)
 
@@ -517,7 +518,7 @@ def handle_move_all_errored(app_instance):
         if moved_count > 0:
             messagebox.showinfo("Success", f"{moved_count} item(s) moved.", parent=app_instance.root)
             app_instance.load_items(app_instance.current_folder.get()) # Refresh
-# New function for auto-deleting similar images
+
 def handle_auto_delete_similar_half(app_instance):
     if not app_instance._similarity_scan_done_for_current_folder:
         messagebox.showinfo("Info", "Please run 'Find Similar Images' in the current folder first.", parent=app_instance.root)
@@ -595,3 +596,129 @@ def handle_auto_delete_similar_half(app_instance):
         messagebox.showwarning("Auto-Delete Info", "No images were actually deleted. They might have already been removed or an error occurred during deletion.", parent=app_instance.root)
 
     app_instance.update_ui_state()
+
+
+def prompt_and_separate_files(app_instance):
+    current_root_folder = app_instance.current_folder.get()
+    if not os.path.isdir(current_root_folder) or current_root_folder == "No folder selected":
+        messagebox.showerror("Error", "Please select a valid root folder first.", parent=app_instance.root)
+        return
+
+    dialog = tk.Toplevel(app_instance.root)
+    dialog.title("Separate Files Options")
+    dialog.transient(app_instance.root); dialog.grab_set()
+
+    ttk.Label(dialog, text=f"Separate files from:\n{current_root_folder}\n").pack(padx=10, pady=10)
+
+    action_type_var = tk.StringVar(value="move")
+    ttk.Radiobutton(dialog, text="Move files (original files will be deleted)", variable=action_type_var, value="move").pack(anchor="w", padx=10)
+    ttk.Radiobutton(dialog, text="Copy files (original files will be kept)", variable=action_type_var, value="copy").pack(anchor="w", padx=10)
+
+    types_to_separate_frame = ttk.LabelFrame(dialog, text="File Types to Separate")
+    types_to_separate_frame.pack(padx=10, pady=5, fill="x")
+
+    separate_screenshots_var = tk.BooleanVar(value=False)
+    separate_videos_var = tk.BooleanVar(value=False)
+
+    ttk.Checkbutton(types_to_separate_frame, text="Screenshots (into 'Screenshots' subfolder)", variable=separate_screenshots_var).pack(anchor="w", padx=5)
+    ttk.Checkbutton(types_to_separate_frame, text="Videos (into 'Videos' subfolder)", variable=separate_videos_var).pack(anchor="w", padx=5)
+
+    ttk.Label(dialog, text="Handle filename conflicts by:").pack(anchor="w", padx=10, pady=(10,0))
+    conflict_resolution_var = tk.StringVar(value="rename")
+    ttk.Radiobutton(dialog, text="Renaming (e.g., file.jpg -> file (1).jpg)", variable=conflict_resolution_var, value="rename").pack(anchor="w", padx=10)
+    ttk.Radiobutton(dialog, text="Skipping duplicates", variable=conflict_resolution_var, value="skip").pack(anchor="w", padx=10)
+    ttk.Radiobutton(dialog, text="Overwriting duplicates (DANGEROUS!)", variable=conflict_resolution_var, value="overwrite").pack(anchor="w", padx=10)
+
+    def on_proceed():
+        action = action_type_var.get()
+        conflict_resolution = conflict_resolution_var.get()
+        do_separate_screenshots = separate_screenshots_var.get()
+        do_separate_videos = separate_videos_var.get()
+        dialog.destroy()
+
+        if not do_separate_screenshots and not do_separate_videos:
+            messagebox.showinfo("Info", "No file types selected for separation.", parent=app_instance.root)
+            return
+
+        dest_dir_screenshots = None
+        dest_dir_videos = None
+        types_being_separated = []
+
+        if do_separate_screenshots:
+            dest_dir_screenshots = os.path.join(current_root_folder, "Screenshots")
+            types_being_separated.append("screenshots")
+        if do_separate_videos:
+            dest_dir_videos = os.path.join(current_root_folder, "Videos")
+            types_being_separated.append("videos")
+
+        types_display = " and ".join(types_being_separated).capitalize()
+        dest_folders_display_parts = []
+        if dest_dir_screenshots: dest_folders_display_parts.append(f"'Screenshots' (in {current_root_folder})")
+        if dest_dir_videos: dest_folders_display_parts.append(f"'Videos' (in {current_root_folder})")
+        dest_folders_display = " and ".join(dest_folders_display_parts)
+
+
+        warning_message = (
+            f"This will {action} {types_display} from '{current_root_folder}' (and its subfolders, excluding the target folders themselves) "
+            f"into {dest_folders_display}.\n"
+            "This can be intensive. ARE YOU SURE?"
+        )
+        if not messagebox.askyesno(f"Confirm Separate {types_display}", warning_message, icon='warning', parent=app_instance.root):
+            return
+
+        # Create destination directories if they don't exist
+        if dest_dir_screenshots: os.makedirs(dest_dir_screenshots, exist_ok=True)
+        if dest_dir_videos: os.makedirs(dest_dir_videos, exist_ok=True)
+
+        app_instance.status_label.config(text=f"{action.capitalize()}ing {types_display}...")
+        app_instance.root.config(cursor="watch")
+        app_instance.cancel_long_operation.clear()
+
+        def status_update(text):
+            if app_instance.root.winfo_exists():
+                app_instance.root.after(0, lambda t=text: app_instance.status_label.config(text=t))
+
+        thread = threading.Thread(
+            target=separate_files_worker_thread_entry,
+            args=(app_instance, current_root_folder, dest_dir_screenshots, dest_dir_videos,
+                  action, conflict_resolution, do_separate_screenshots, do_separate_videos, status_update),
+            daemon=True
+        )
+        thread.start()
+
+    button_frame = ttk.Frame(dialog)
+    button_frame.pack(pady=10)
+    ttk.Button(button_frame, text="Proceed", command=on_proceed).pack(side=tk.LEFT, padx=5)
+    ttk.Button(button_frame, text="Cancel", command=dialog.destroy).pack(side=tk.LEFT, padx=5)
+    dialog.update_idletasks()
+    x = app_instance.root.winfo_x() + (app_instance.root.winfo_width() - dialog.winfo_width()) // 2
+    y = app_instance.root.winfo_y() + (app_instance.root.winfo_height() - dialog.winfo_height()) // 2
+    dialog.geometry(f"+{x}+{y}")
+
+
+def separate_files_worker_thread_entry(app_instance, root_dir, dest_screenshots, dest_videos,
+                                       action, conflict_res, sep_ss, sep_vid, status_cb):
+    action_ss, action_vid, skipped, errors, total_found = separate_files_core(
+        root_dir, dest_screenshots, dest_videos, action, conflict_res,
+        sep_ss, sep_vid,
+        app_instance.Image, app_instance.UnidentifiedImageError, # For screenshot detection
+        app_instance.cancel_long_operation, status_cb
+    )
+
+    if app_instance.root.winfo_exists():
+        app_instance.root.after(0, lambda: app_instance.root.config(cursor=""))
+        summary_parts = ["File Separation Complete!\n"]
+        if sep_ss:
+            summary_parts.append(f"Screenshots {action}d: {action_ss}")
+        if sep_vid:
+            summary_parts.append(f"Videos {action}d: {action_vid}")
+        summary_parts.append(f"Skipped: {skipped}")
+        summary_parts.append(f"Errors: {errors}")
+        summary_parts.append(f"Total relevant media files processed: {total_found}")
+        summary_message = "\n".join(summary_parts)
+
+        app_instance.root.after(0, lambda: app_instance.status_label.config(text="Separation finished."))
+        app_instance.root.after(0, lambda msg=summary_message: messagebox.showinfo("Separation Result", msg, parent=app_instance.root))
+
+        if os.path.isdir(app_instance.current_folder.get()):
+            app_instance.root.after(0, lambda: app_instance.load_items(app_instance.current_folder.get()))
