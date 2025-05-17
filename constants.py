@@ -8,8 +8,8 @@ VIDEO_EXTENSIONS = ('.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv')
 
 # --- UI Sizes ---
 GRID_THUMBNAIL_SIZE = (120, 120)
-PREVIEW_THUMBNAIL_SIZE = (350, 350) 
-PREVIEW_CONTAINER_SIZE = (350, 350) 
+PREVIEW_THUMBNAIL_SIZE = (350, 350)
+PREVIEW_CONTAINER_SIZE = (350, 350)
 GRID_COLUMNS = 5
 
 # --- Performance & Limits ---
@@ -24,8 +24,11 @@ SELECTED_COLOR = "#ADD8E6"
 ERROR_COLOR = "#FF9999"
 SIMILAR_COLOR = "#FFD700"
 LOADING_TEXT = "..."
-IMAGE_VIEWER_BG = "black" 
+IMAGE_VIEWER_BG = "black"
 
 # --- Configuration Paths & Names ---
 FOLDER_THUMB_DB_FILENAME = "folder_thumbs.json"
 TRASH_DIR_NAME = ".app_trash_v3"
+
+# --- Trash Settings ---
+TRASH_MAX_ITEMS = 3 # Keep the last N deleted items in trash before permanent deletion of oldest

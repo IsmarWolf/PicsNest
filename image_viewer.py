@@ -166,7 +166,7 @@ class ImageViewerWindow(tk.Toplevel):
         if not self.image_paths or not (0 <= self.current_image_index < len(self.image_paths)): return
         path_to_delete = self.image_paths[self.current_image_index]
         
-        deleted_successfully = self.main_app.delete_selected_items_action(items_to_delete_override={path_to_delete}, from_viewer=True)
+        deleted_successfully = self.main_app.delete_selected_items_action_entry(items_to_delete_override={path_to_delete}, from_viewer=True)
         
         if deleted_successfully:
             self.items_deleted_from_viewer = True # Mark deletion

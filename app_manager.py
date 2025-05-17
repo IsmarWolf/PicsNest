@@ -1,3 +1,5 @@
+#app_manager.py
+# --- Imports ---
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
 import os
@@ -6,61 +8,45 @@ import subprocess
 import threading
 import queue
 import time
-import json
-import shutil
-import math
+import json, math, shutil # Ensure shutil is imported
+# import math # Keep if still used directly, otherwise remove
 import collections # For deque (Undo stack)
 from datetime import datetime
 
+# Local imports for viewers and constants
 from image_viewer import ImageViewerWindow
-from video_viewer import VideoViewerWindow # For date formatting
+from video_viewer import VideoViewerWindow
+from constants import * # Import all constants
+from constants import TRASH_MAX_ITEMS # Specifically for app_manager if needed, or rely on action_handlers
 
 # --- External Libraries ---
+# These are checked and messages shown in __init__
 try:
     from PIL import Image, ImageTk, UnidentifiedImageError
 except ImportError:
-    messagebox.showerror("Error", "Pillow library not found.\nPlease install it using: pip install Pillow")
-    sys.exit(1)
+    Image = None
+    ImageTk = None
+    UnidentifiedImageError = None
+    # Critical error handled in main.py
 
 try:
-    import vlc
+    import vlc as vlc_module # Alias to avoid conflict if vlc is also a var name
 except ImportError:
-    vlc = None
+    vlc_module = None
 
 try:
-    import imagehash
+    import imagehash as imagehash_module # Alias
 except ImportError:
-    imagehash = None
+    imagehash_module = None
 
 try:
-    import cv2 # OpenCV for video thumbnails
+    import cv2 as cv2_module # Alias
 except ImportError:
-    cv2 = None
+    cv2_module = None
 
-# --- Constants ---
-IMAGE_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.gif', '.bmp', '.tiff', '.webp')
-VIDEO_EXTENSIONS = ('.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv')
-GRID_THUMBNAIL_SIZE = (120, 120)
-PREVIEW_THUMBNAIL_SIZE = (350, 350) 
-PREVIEW_CONTAINER_SIZE = (350, 350) 
-GRID_COLUMNS = 5
-LAZY_LOAD_BATCH_SIZE = 20
-UNDO_STACK_MAX_SIZE = 10
+# --- Modularized Utilities ---
+from app_manager_utils import ui_creator, file_operations, action_handlers
 
-# --- Colors & Styles ---
-FOLDER_COLOR = "#F4D37B"
-PLACEHOLDER_COLOR = "#EAEAEA"
-FILE_COLOR = "#FFFFFF"
-SELECTED_COLOR = "#ADD8E6"
-ERROR_COLOR = "#FF9999"
-SIMILAR_COLOR = "#FFD700"
-LOADING_TEXT = "..."
-IMAGE_VIEWER_BG = "black" 
-
-# --- Configuration ---
-CONFIG_DIR = os.path.dirname(os.path.abspath(__file__))
-FOLDER_THUMB_DB_FILENAME = "folder_thumbs.json"
-TRASH_DIR_NAME = ".app_trash_v3"
 
 # --- Application Class ---
 class PhotoVideoManagerApp:
@@ -69,81 +55,146 @@ class PhotoVideoManagerApp:
         self.root.title("Photo & Video Manager")
         self.root.geometry("1250x800")
 
+        # Store library references for other modules to access via app_instance
+        self.Image = Image
+        self.ImageTk = ImageTk
+        self.UnidentifiedImageError = UnidentifiedImageError
+        self.vlc = vlc_module # Use the aliased import
+        self.imagehash = imagehash_module # Use the aliased import
+        self.cv2 = cv2_module # Use the aliased import
+
+        # Add constants here to be accessible via app_instance as used in action_handlers.py
+        self.IMAGE_EXTENSIONS = IMAGE_EXTENSIONS
+        self.VIDEO_EXTENSIONS = VIDEO_EXTENSIONS
+        # Other constants from constants.py can be added here if needed by helper modules via app_instance
+        self.TRASH_MAX_ITEMS = TRASH_MAX_ITEMS # Make accessible if needed
+
+        # Config paths
         self.CONFIG_DIR = os.path.dirname(os.path.abspath(__file__))
         self.FOLDER_THUMB_DB_FILE = os.path.join(self.CONFIG_DIR, FOLDER_THUMB_DB_FILENAME)
-        self.TRASH_DIR = os.path.join(self.CONFIG_DIR, TRASH_DIR_NAME) 
+        self.TRASH_DIR = os.path.join(self.CONFIG_DIR, TRASH_DIR_NAME)
         os.makedirs(self.TRASH_DIR, exist_ok=True)
 
-
+        # Core State Variables
         self.current_folder = tk.StringVar(value="No folder selected")
         self.folder_history = []
-        self.items_in_view = {}
+        self.items_in_view = {} # path: {widget, thumb_label, name_label, type, is_error, etc.}
 
         self.selected_item_paths = set()
 
         self.thumbnail_queue = queue.Queue()
-        self.active_thumbnail_thread = None
-        self.cancel_long_operation = threading.Event()
+        self.active_thumbnail_thread = None # Thread for batch thumbnail generation
+        self.cancel_long_operation = threading.Event() # For any long task
 
         self.folder_thumb_db = self._load_folder_thumb_db()
 
-        self.all_folder_items_raw = []
-        self.all_folder_items = []
+        self.all_folder_items_raw = [] # All items scanned from folder, before any filtering
+        self.all_folder_items = []     # Items after type filtering (image/video) but before similarity filter
         self.displayed_item_count = 0
         self.current_grid_row = 0
         self.current_grid_col = 0
         self.is_loading_batch = False
 
+        # Rubber band selection
         self.rubber_band_rect = None
         self.rubber_band_start_x = 0
         self.rubber_band_start_y = 0
 
         self.undo_stack = collections.deque(maxlen=UNDO_STACK_MAX_SIZE)
 
+        # Filter and View Variables
         self.show_only_similar_var = tk.BooleanVar(value=False)
         self.show_images_var = tk.BooleanVar(value=True)
         self.show_videos_var = tk.BooleanVar(value=True)
 
-        self.similar_image_groups = []
-        self.image_hashes_cache = {}
-        self.marked_similar_paths = set()
-        self.is_finding_similar = False
-        self.similarity_threshold = 5 
-        self._was_filter_active_before_style_refresh = False
-        self._similarity_scan_done_for_current_folder = False
+        # Similarity Search State
+        self.similar_image_groups = []    # List of sets, where each set contains paths of similar images
+        self.image_hashes_cache = {}      # path: image_hash_object
+        self.marked_similar_paths = set() # All paths that are part of any similar group
+        self.is_finding_similar = False   # Flag to prevent multiple concurrent searches
+        self.similarity_threshold = 5     # Imagehash difference threshold
+        self._was_filter_active_before_style_refresh = False # Internal state for UI refresh
+        self._similarity_scan_done_for_current_folder = False # Flag per folder
 
+        # --- UI Creation using ui_creator ---
         self.root.grid_columnconfigure(0, weight=3)
         self.root.grid_columnconfigure(1, weight=1)
         self.root.grid_rowconfigure(1, weight=1)
 
-        self._create_menu()
-        self._create_top_bar()
-        self._create_main_content_area()
-        self._create_preview_area() 
-        self._create_action_bar()
-        self._apply_styles()
+        ui_creator.create_menu(self)
+        ui_creator.create_top_bar(self)
+        ui_creator.create_main_content_area(self)
+        ui_creator.create_preview_area(self)
+        ui_creator.create_action_bar(self)
+        ui_creator.apply_app_styles()
 
+        # --- Post-UI Initialization ---
         self.root.after(100, self._process_thumbnail_queue)
         self.update_ui_state()
 
+        # --- Global Event Bindings ---
         self.root.bind("<Delete>", self.on_delete_key_press)
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
 
-        if vlc is None:
-            messagebox.showwarning("VLC Warning", "VLC library (python-vlc) not found. Video playback features will be limited or disabled.\nPlease install it for full video support (e.g., 'pip install python-vlc').")
-        if imagehash is None:
-             messagebox.showwarning("ImageHash Warning", "The 'imagehash' library is not found. 'Find Similar Images' feature will be disabled.\nPlease install it: pip install imagehash")
-        if cv2 is None:
-            messagebox.showwarning("OpenCV Warning", "The 'opencv-python' (cv2) library is not found. Video thumbnails will not be generated.\nPlease install it: pip install opencv-python")
+        # --- Library Warnings ---
+        if self.vlc is None:
+            messagebox.showwarning("VLC Warning", "VLC library (python-vlc) not found. Video playback features will be limited or disabled.\nPlease install it for full video support (e.g., 'pip install python-vlc').", parent=self.root)
+        if self.imagehash is None:
+             messagebox.showwarning("ImageHash Warning", "The 'imagehash' library is not found. 'Find Similar Images' feature will be disabled.\nPlease install it: pip install imagehash", parent=self.root)
+        if self.cv2 is None:
+            messagebox.showwarning("OpenCV Warning", "The 'opencv-python' (cv2) library is not found. Video thumbnails will not be generated.\nPlease install it: pip install opencv-python", parent=self.root)
+        if self.Image is None or self.ImageTk is None: # Should be caught by main.py but good to check
+            messagebox.showerror("Critical Error", "Pillow library failed to load. Application cannot continue.", parent=self.root)
+            self.root.destroy()
+            sys.exit(1)
 
+
+    # --- Application Lifecycle & Configuration ---
     def on_closing(self):
         self._save_folder_thumb_db()
-        self.cancel_long_operation.set() 
+        self.cancel_long_operation.set()
+        # Ensure any running threads are signaled to stop
+        if self.active_thumbnail_thread and self.active_thumbnail_thread.is_alive():
+            self.active_thumbnail_thread.join(timeout=0.5) # Brief wait
+        # Add joins for other potential long-running threads if necessary
+
+        self._empty_trash_permanently() # Empty the trash before destroying the root window
+
         self.root.destroy()
+
+    def _empty_trash_permanently(self):
+        """Permanently deletes all items in the application's trash directory."""
+        if not os.path.isdir(self.TRASH_DIR):
+            # print(f"Trash directory {self.TRASH_DIR} not found. Nothing to empty.")
+            return
+
+        # print(f"Attempting to empty trash directory: {self.TRASH_DIR}")
+        items_deleted_count = 0
+        items_failed_count = 0
+
+        for item_name in os.listdir(self.TRASH_DIR):
+            item_path = os.path.join(self.TRASH_DIR, item_name)
+            try:
+                if os.path.isfile(item_path) or os.path.islink(item_path):
+                    os.unlink(item_path)
+                    items_deleted_count += 1
+                elif os.path.isdir(item_path): # Should not happen with current trash logic
+                    shutil.rmtree(item_path)
+                    items_deleted_count += 1
+            except Exception as e:
+                items_failed_count += 1
+                print(f"Error deleting {item_path} from trash: {e}")
+
+        # if items_deleted_count > 0 or items_failed_count > 0:
+            # print(f"Trash emptying complete. Deleted: {items_deleted_count}, Failed: {items_failed_count}.")
+        if items_failed_count > 0 and self.root.winfo_exists(): # Only show message if app window still there
+             messagebox.showwarning("Trash Emptying Issue",
+                                   f"Could not delete all items from trash. {items_failed_count} items may remain in {self.TRASH_DIR}",
+                                   parent=self.root)
 
     def _load_folder_thumb_db(self):
         try:
-            if os.path.exists(self.FOLDER_THUMB_DB_FILE): 
+            if os.path.exists(self.FOLDER_THUMB_DB_FILE):
                 with open(self.FOLDER_THUMB_DB_FILE, 'r') as f:
                     content = f.read()
                     return json.loads(content if content else '{}')
@@ -157,129 +208,12 @@ class PhotoVideoManagerApp:
 
     def _save_folder_thumb_db(self):
         try:
-            with open(self.FOLDER_THUMB_DB_FILE, 'w') as f: 
+            with open(self.FOLDER_THUMB_DB_FILE, 'w') as f:
                 json.dump(self.folder_thumb_db, f, indent=4)
         except Exception as e:
             print(f"Error saving folder thumb DB: {e}")
 
-    def _create_menu(self):
-        menubar = tk.Menu(self.root)
-        self.root.config(menu=menubar)
-
-        file_menu = tk.Menu(menubar, tearoff=0)
-        menubar.add_cascade(label="File", menu=file_menu)
-        file_menu.add_command(label="Select Root Folder...", command=self.select_root_folder)
-        file_menu.add_separator()
-        file_menu.add_command(label="Exit", command=self.on_closing)
-
-        self.edit_menu = tk.Menu(menubar, tearoff=0)
-        menubar.add_cascade(label="Edit", menu=self.edit_menu)
-        self.edit_menu.add_command(label="Undo", command=self._undo_last_action, state=tk.DISABLED)
-
-        self.view_menu = tk.Menu(menubar, tearoff=0)
-        menubar.add_cascade(label="View", menu=self.view_menu)
-        self.view_menu.add_checkbutton(label="Show Images", variable=self.show_images_var, command=self.apply_all_filters_and_refresh)
-        self.view_menu.add_checkbutton(label="Show Videos", variable=self.show_videos_var, command=self.apply_all_filters_and_refresh)
-        self.view_menu.add_separator()
-        self.view_menu.add_checkbutton(label="Show Only Similar Images", variable=self.show_only_similar_var, command=self.handle_show_similar_toggle)
-
-        tools_menu = tk.Menu(menubar, tearoff=0)
-        menubar.add_cascade(label="Tools", menu=tools_menu)
-        tools_menu.add_command(label="Find Similar Images in Current Folder", command=self._find_similar_images_action)
-        tools_menu.add_command(label="Consolidate Media from Root...", command=self._consolidate_media_action)
-        tools_menu.add_command(label="Organize Media by Date from Root...", command=self._organize_media_by_date_action)
-        tools_menu.add_separator()
-        tools_menu.add_command(label="Delete All Errored Items...", command=self._delete_all_errored_action)
-        tools_menu.add_command(label="Move All Errored Items To...", command=self._move_all_errored_action)
-
-    def _create_top_bar(self):
-        top_frame = ttk.Frame(self.root, padding="5")
-        top_frame.grid(row=0, column=0, columnspan=2, sticky="ew")
-        
-        self.up_button = ttk.Button(top_frame, text="Up", command=self.navigate_up, state=tk.DISABLED)
-        self.up_button.pack(side=tk.LEFT, padx=(0, 5))
-        
-        folder_label = ttk.Label(top_frame, textvariable=self.current_folder, relief="sunken", padding="2")
-        folder_label.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
-
-        self.status_label = ttk.Label(top_frame, text="", width=35) 
-        self.status_label.pack(side=tk.LEFT, padx=10)
-
-    def _create_main_content_area(self):
-        content_frame = ttk.Frame(self.root, padding=(5, 0, 0, 0))
-        content_frame.grid(row=1, column=0, sticky="nsew")
-        content_frame.grid_rowconfigure(0, weight=1)
-        content_frame.grid_columnconfigure(0, weight=1)
-        self.canvas = tk.Canvas(content_frame, borderwidth=0, background="#ffffff")
-        self.item_frame = ttk.Frame(self.canvas, padding="5", style="View.TFrame")
-        self.canvas.create_window((0, 0), window=self.item_frame, anchor="nw", tags="self.item_frame")
-        vsb = ttk.Scrollbar(content_frame, orient="vertical", command=self.canvas.yview)
-        hsb = ttk.Scrollbar(content_frame, orient="horizontal", command=self.canvas.xview)
-        self.canvas.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
-        self.canvas.grid(row=0, column=0, sticky="nsew")
-        vsb.grid(row=0, column=1, sticky="ns")
-        hsb.grid(row=1, column=0, sticky="ew")
-        self.item_frame.bind("<Configure>", self.on_frame_configure)
-        if sys.platform == "win32" or sys.platform == "darwin":
-             self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
-        else:
-             self.canvas.bind_all("<Button-4>", lambda e: self._on_mousewheel(e, direction=-1))
-             self.canvas.bind_all("<Button-5>", lambda e: self._on_mousewheel(e, direction=1))
-        
-        self.canvas.bind("<ButtonPress-1>", self._on_canvas_press_for_rubber_band)
-        self.canvas.bind("<B1-Motion>", self._on_canvas_motion_for_rubber_band)
-        self.canvas.bind("<ButtonRelease-1>", self._on_canvas_release_for_rubber_band)
-
-    def _create_preview_area(self): 
-        preview_area_lf = ttk.LabelFrame(self.root, text="Preview & Info", padding="10")
-        preview_area_lf.grid(row=1, column=1, sticky="nsew", padx=(5, 5), pady=(0, 5))
-        preview_area_lf.grid_columnconfigure(0, weight=1)
-        preview_area_lf.grid_rowconfigure(0, weight=3) 
-        preview_area_lf.grid_rowconfigure(1, weight=1)  
-
-        self.preview_image_container = ttk.Frame(preview_area_lf, 
-                                                 width=PREVIEW_CONTAINER_SIZE[0], 
-                                                 height=PREVIEW_CONTAINER_SIZE[1])
-        self.preview_image_container.grid_propagate(False) 
-        self.preview_image_container.grid(row=0, column=0, sticky="nsew", pady=(0,10))
-        
-        self.preview_label = ttk.Label(self.preview_image_container, text="Select an item", anchor="center", background="lightgrey")
-        self.preview_label.pack(expand=True, fill=tk.BOTH) 
-        self.preview_image_obj = None 
-
-        info_subframe = ttk.Frame(preview_area_lf)
-        info_subframe.grid(row=1, column=0, sticky="nsew", pady=(10,0))
-        self.info_name_label = ttk.Label(info_subframe, text="Name: -", wraplength=PREVIEW_CONTAINER_SIZE[0] - 20)
-        self.info_name_label.pack(anchor="w", pady=1)
-        self.info_size_label = ttk.Label(info_subframe, text="Size: -")
-        self.info_size_label.pack(anchor="w", pady=1)
-        self.info_type_label = ttk.Label(info_subframe, text="Type: -")
-        self.info_type_label.pack(anchor="w", pady=1)
-
-    def _create_action_bar(self):
-        action_frame = ttk.Frame(self.root, padding="5")
-        action_frame.grid(row=2, column=0, columnspan=2, sticky="ew")
-        self.open_button = ttk.Button(action_frame, text="Open/View", command=self.open_selected_item_action, state=tk.DISABLED)
-        self.open_button.pack(side=tk.LEFT, padx=5)
-        self.delete_button = ttk.Button(action_frame, text="Delete Selected", command=self.delete_selected_items_action, state=tk.DISABLED)
-        self.delete_button.pack(side=tk.LEFT, padx=5)
-        self.undo_button = ttk.Button(action_frame, text="Undo", command=self._undo_last_action, state=tk.DISABLED)
-        self.undo_button.pack(side=tk.LEFT, padx=5)
-
-    def _apply_styles(self):
-        style = ttk.Style()
-        try:
-             if 'vista' in style.theme_names(): style.theme_use('vista')
-             elif 'clam' in style.theme_names(): style.theme_use('clam')
-        except tk.TclError: pass
-        style.configure("View.TFrame", background="#ffffff")
-        style.configure("Item.TFrame", background=PLACEHOLDER_COLOR, borderwidth=1, relief='raised')
-        style.configure("ItemLoaded.TFrame", background=FILE_COLOR, borderwidth=1, relief='raised')
-        style.configure("Folder.TFrame", background=FOLDER_COLOR, borderwidth=1, relief='raised')
-        style.configure("Selected.TFrame", background=SELECTED_COLOR, borderwidth=2, relief='solid')
-        style.configure("Error.TFrame", background=ERROR_COLOR, borderwidth=1, relief='raised')
-        style.configure("Similar.TFrame", background=SIMILAR_COLOR, borderwidth=2, relief='solid')
-
+    # --- UI Event Handlers & Callbacks (Canvas, Frame, Mousewheel) ---
     def on_frame_configure(self, event=None):
         self.canvas.configure(scrollregion=self.canvas.bbox("all"))
 
@@ -296,26 +230,30 @@ class PhotoVideoManagerApp:
         if self.is_loading_batch or self.displayed_item_count >= len(self.all_folder_items): return
         self.canvas.update_idletasks()
         scroll_info = self.canvas.yview()
+        # Condition to load more: near bottom or if content is smaller than canvas
         if (scroll_info[1] > 0.85 or \
            (scroll_info[0] == 0.0 and scroll_info[1] == 1.0 and self.item_frame.winfo_height() < self.canvas.winfo_height())) \
            and self.displayed_item_count < len(self.all_folder_items):
             self._load_next_batch_of_items()
-            
+
     def _on_canvas_press_for_rubber_band(self, event):
-        self._clear_all_selection_visuals() 
-        self.selected_item_paths.clear()
-        
-        self.rubber_band_start_x = self.canvas.canvasx(event.x)
-        self.rubber_band_start_y = self.canvas.canvasy(event.y)
-        if self.rubber_band_rect:
-            self.canvas.delete(self.rubber_band_rect)
-        self.rubber_band_rect = self.canvas.create_rectangle(
-            self.rubber_band_start_x, self.rubber_band_start_y,
-            self.rubber_band_start_x, self.rubber_band_start_y,
-            outline="blue", width=1, dash=(4, 2), tags="rubber_band_tag"
-        )
-        self.update_preview_and_info() 
-        self.update_ui_state()
+        # Click on canvas directly (not on an item) clears selection for rubber band
+        clicked_widget = event.widget
+        if clicked_widget == self.canvas: # Only if click is directly on canvas
+            self._clear_all_selection_visuals()
+            self.selected_item_paths.clear()
+
+            self.rubber_band_start_x = self.canvas.canvasx(event.x)
+            self.rubber_band_start_y = self.canvas.canvasy(event.y)
+            if self.rubber_band_rect:
+                self.canvas.delete(self.rubber_band_rect)
+            self.rubber_band_rect = self.canvas.create_rectangle(
+                self.rubber_band_start_x, self.rubber_band_start_y,
+                self.rubber_band_start_x, self.rubber_band_start_y,
+                outline="blue", width=1, dash=(4, 2), tags="rubber_band_tag"
+            )
+            self.update_preview_and_info()
+            self.update_ui_state()
 
     def _on_canvas_motion_for_rubber_band(self, event):
         if self.rubber_band_rect:
@@ -325,8 +263,7 @@ class PhotoVideoManagerApp:
 
     def _on_canvas_release_for_rubber_band(self, event):
         if self.rubber_band_rect:
-            self.canvas.delete(self.rubber_band_rect)
-            self.rubber_band_rect = None
+            self.canvas.itemconfigure("rubber_band_tag", state='hidden') # Hide then delete
             end_x = self.canvas.canvasx(event.x)
             end_y = self.canvas.canvasy(event.y)
 
@@ -335,141 +272,70 @@ class PhotoVideoManagerApp:
             sel_x2 = max(self.rubber_band_start_x, end_x)
             sel_y2 = max(self.rubber_band_start_y, end_y)
 
+            # Check if it was a click (small area) vs a drag
+            if abs(sel_x1 - sel_x2) < 5 and abs(sel_y1 - sel_y2) < 5:
+                # It was a click on canvas, selection already cleared by _on_canvas_press_for_rubber_band
+                self.canvas.delete(self.rubber_band_rect)
+                self.rubber_band_rect = None
+                self.update_preview_and_info()
+                self.update_ui_state()
+                return
+
             newly_selected_paths = set()
             for item_path, info in self.items_in_view.items():
                 widget = info['widget']
                 if not widget.winfo_exists(): continue
-                
-                x, y = widget.winfo_x(), widget.winfo_y() 
+
+                # Get widget geometry relative to the canvas
+                # widget.winfo_rootx/y() are screen coords. We need canvas coords.
+                # Item frame is the direct child of canvas window.
+                # So widget.winfo_x/y() should be relative to item_frame.
+                # Add item_frame's position if it's not (0,0) in canvas scrollregion.
+                # However, since canvas.create_window places item_frame at (0,0) initially
+                # and scrollregion handles the view, widget.winfo_x/y directly should be okay
+                # if the rubber band coords are also canvas coords (which they are via canvasx/y).
+
+                x, y = widget.winfo_x(), widget.winfo_y()
                 w, h = widget.winfo_width(), widget.winfo_height()
-                
+
+                # Check for overlap
                 if not (sel_x2 < x or sel_x1 > x + w or sel_y2 < y or sel_y1 > y + h):
                     newly_selected_paths.add(item_path)
-            
+
             if newly_selected_paths:
-                self.selected_item_paths = newly_selected_paths 
-                for path in self.selected_item_paths: 
+                self.selected_item_paths = newly_selected_paths # Replace selection
+                for path in self.selected_item_paths:
                     if path in self.items_in_view and self.items_in_view[path]['widget'].winfo_exists():
-                        style = self._get_item_style(path, self.items_in_view[path]) 
+                        style = self._get_item_style(path, self.items_in_view[path])
                         self.items_in_view[path]['widget'].configure(style=style)
-            
+
+            self.canvas.delete(self.rubber_band_rect) # Ensure it's deleted
+            self.rubber_band_rect = None
             self.update_preview_and_info()
             self.update_ui_state()
 
+    # --- Folder Navigation & Loading ---
     def select_root_folder(self):
-        folder_path = filedialog.askdirectory()
-        if folder_path: 
-            self.folder_history = []
+        folder_path = filedialog.askdirectory(parent=self.root)
+        if folder_path:
+            self.folder_history = [] # Reset history for a new root
             self.load_items(folder_path)
 
     def navigate_to_folder(self, folder_path):
         if os.path.isdir(folder_path) and self.current_folder.get() != folder_path:
             self.folder_history.append(self.current_folder.get())
             self.load_items(folder_path)
-        elif not os.path.isdir(folder_path): messagebox.showerror("Error", "Not a valid folder.")
+        elif not os.path.isdir(folder_path):
+            messagebox.showerror("Error", "Not a valid folder.", parent=self.root)
 
     def navigate_up(self):
-        if self.folder_history: 
-            self.load_items(self.folder_history.pop())
-
-    def _thumbnail_generator_thread(self, items_to_process, cancel_event):
-        for item in items_to_process:
-            if cancel_event.is_set(): break
-            thumb_image, error_flag = None, False
-            try:
-                if item['type'] == 'file':
-                    _, ext = os.path.splitext(item['name']); ext_lower = ext.lower()
-                    if ext_lower in IMAGE_EXTENSIONS:
-                        img = Image.open(item['path'])
-                        try: 
-                            exif = img.getexif(); ot = 274 
-                            if ot in exif:
-                                o = exif[ot]
-                                if o == 3: img = img.rotate(180, expand=True)
-                                elif o == 6: img = img.rotate(-90, expand=True)
-                                elif o == 8: img = img.rotate(90, expand=True)
-                        except Exception: pass 
-                        img.thumbnail(GRID_THUMBNAIL_SIZE, Image.Resampling.LANCZOS)
-                        if img.mode not in ('RGB', 'RGBA'): img = img.convert('RGB')
-                        thumb_image = img
-                    elif ext_lower in VIDEO_EXTENSIONS and cv2:
-                        try:
-                            cap = cv2.VideoCapture(item['path'])
-                            if cap.isOpened():
-                                frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-                                frame_no = min(frame_count // 10, 100) if frame_count > 10 else 0
-                                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_no)
-                                ret, frame = cap.read() 
-                                if ret:
-                                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                                    img = Image.fromarray(frame_rgb)
-                                    img.thumbnail(GRID_THUMBNAIL_SIZE, Image.Resampling.LANCZOS)
-                                    thumb_image = img
-                            if cap: cap.release() 
-                        except Exception as e_vid: print(f"Vid thumb error {item['path']}: {e_vid}")
-                self.thumbnail_queue.put({'path': item['path'], 'image': thumb_image, 'error': error_flag, 'type': item['type']})
-            except UnidentifiedImageError: self.thumbnail_queue.put({'path': item['path'], 'image': None, 'error': True, 'type': item['type']})
-            except Exception as e: print(f"Thumb gen error {item['path']}: {e}"); self.thumbnail_queue.put({'path': item['path'], 'image': None, 'error': True, 'type': item['type']})
-
-    def _get_item_style(self, item_path, item_info):
-        is_selected = item_path in self.selected_item_paths
-        is_similar = item_path in self.marked_similar_paths
-        is_error = item_info.get('is_error', False)
-        item_type = item_info['type']
-
-        if is_selected: return "Selected.TFrame"
-        if is_similar and item_type == 'file': return "Similar.TFrame" 
-        
-        if item_type == 'folder': return "Folder.TFrame"
-        elif item_type == 'file':
-            if is_error: return "Error.TFrame"
-            has_thumb_image = 'thumb_label' in item_info and \
-                              item_info['thumb_label'].winfo_exists() and \
-                              item_info['thumb_label'].cget("image") 
-            return "ItemLoaded.TFrame" if has_thumb_image else "Item.TFrame"
-        return "Item.TFrame"
-
-    def _process_thumbnail_queue(self):
-        max_updates_per_cycle = 10; processed_count = 0
-        try:
-            while not self.thumbnail_queue.empty() and processed_count < max_updates_per_cycle:
-                result = self.thumbnail_queue.get_nowait(); processed_count += 1
-                item_path = result['path']
-                if item_path in self.items_in_view: 
-                    widget_info = self.items_in_view[item_path]
-                    widget_frame, thumb_label = widget_info['widget'], widget_info['thumb_label']
-                    widget_info['is_error'] = result['error']
-
-                    if widget_frame.winfo_exists() and thumb_label.winfo_exists():
-                        final_style = self._get_item_style(item_path, widget_info)
-                        widget_frame.configure(style=final_style)
-
-                        if result['error']:
-                            thumb_label.config(image='', text="Error", font=("Arial", 9, "bold"), foreground="red")
-                            if hasattr(thumb_label, 'image'): thumb_label.image = None
-                        elif result['image']:
-                            try:
-                                 tk_image = ImageTk.PhotoImage(result['image'])
-                                 thumb_label.image = tk_image; 
-                                 thumb_label.config(image=tk_image, text="")
-                            except Exception as e:
-                                 print(f"Tkinter PhotoImage error for {item_path}: {e}")
-                                 thumb_label.config(image='', text="Display Err", font=("Arial", 8))
-                                 widget_info['is_error'] = True
-                                 widget_frame.configure(style=self._get_item_style(item_path, widget_info))
-                                 if hasattr(thumb_label, 'image'): thumb_label.image = None
-                        else: 
-                            if item_path.lower().endswith(VIDEO_EXTENSIONS):
-                                thumb_label.config(image='', text="📹 Video", font=("Arial", 10, "bold"))
-                            if hasattr(thumb_label, 'image'): 
-                                thumb_label.image = None
-        except queue.Empty: pass
-        except Exception as e: print(f"Error processing thumbnail queue: {e}")
-        finally: self.root.after(100, self._process_thumbnail_queue)
+        if self.folder_history:
+            prev_folder = self.folder_history.pop()
+            self.load_items(prev_folder)
 
     def load_items(self, folder_path):
         is_new_folder_context = self.current_folder.get() != folder_path or not self.all_folder_items_raw
-        
+
         if is_new_folder_context:
             self.similar_image_groups = []
             self.image_hashes_cache = {}
@@ -478,179 +344,392 @@ class PhotoVideoManagerApp:
             if hasattr(self, 'status_label') and self.status_label: self.status_label.config(text="")
             self._was_filter_active_before_style_refresh = self.show_only_similar_var.get()
 
-        if not os.path.isdir(folder_path): 
-            messagebox.showerror("Error", "Cannot access folder.")
+        if not os.path.isdir(folder_path):
+            messagebox.showerror("Error", "Cannot access folder.", parent=self.root)
             if is_new_folder_context: self.current_folder.set("No folder selected")
+            self.all_folder_items_raw = []
+            self.all_folder_items = []
+            self.clear_view()
+            self.update_ui_state()
             return
 
-        if self.active_thumbnail_thread and self.active_thumbnail_thread.is_alive(): 
-            self.cancel_long_operation.set() 
-        self.cancel_long_operation.clear()
-        
+        # Cancel any ongoing thumbnail generation for the previous folder
+        if self.active_thumbnail_thread and self.active_thumbnail_thread.is_alive():
+            self.cancel_long_operation.set()
+            # self.active_thumbnail_thread.join(timeout=0.2) # Brief wait
+        self.cancel_long_operation.clear() # Reset for new operations
+
+        # Clear the thumbnail queue
         while not self.thumbnail_queue.empty():
             try: self.thumbnail_queue.get_nowait()
             except queue.Empty: break
-        
+
         self.current_folder.set(folder_path)
-        self.clear_view()
+        self.clear_view() # Clears displayed items, selected_item_paths, resets grid counters
 
         current_raw_items = []
         try:
             for entry in os.scandir(folder_path):
-                try: 
+                try:
                     is_dir, is_file = entry.is_dir(), entry.is_file()
-                except OSError: continue
-                
+                except OSError: continue # Skip if cannot determine type (e.g. permission denied early)
+
                 item_type = 'folder' if is_dir else ('file' if is_file else 'other')
                 if item_type == 'other': continue
-                
-                if item_type == 'file':
-                    _, ext = os.path.splitext(entry.name); ext_lower = ext.lower()
-                    is_image = ext_lower in IMAGE_EXTENSIONS
-                    is_video = ext_lower in VIDEO_EXTENSIONS
-                    if not ((self.show_images_var.get() and is_image) or \
-                            (self.show_videos_var.get() and is_video)):
-                        continue 
+
                 current_raw_items.append({'path': entry.path, 'name': entry.name, 'type': item_type, 'is_error': False})
-        except OSError as e: 
-            messagebox.showerror("Error", f"Error reading folder: {e}")
-            self.current_folder.set("Error reading folder"); return
-        
+        except OSError as e:
+            messagebox.showerror("Error", f"Error reading folder: {e}", parent=self.root)
+            self.current_folder.set("Error reading folder")
+            self.all_folder_items_raw = []
+            self.all_folder_items = []
+            self.update_ui_state()
+            return
+
+        # Sort folders first, then files, alphabetically
         current_raw_items.sort(key=lambda x: (x['type'] != 'folder', x['name'].lower()))
         self.all_folder_items_raw = current_raw_items
 
-        if self.show_only_similar_var.get() and self.marked_similar_paths:
-            self.all_folder_items = [
-                item for item in self.all_folder_items_raw 
-                if item['type'] == 'folder' or \
-                   (item['type'] == 'file' and item['path'] in self.marked_similar_paths)
-            ]
-        else:
-            self.all_folder_items = list(self.all_folder_items_raw)
+        # Apply view filters (Show Images/Videos)
+        self._apply_type_filters_to_items_list()
 
-        if self.all_folder_items: 
+        # --- START OF MODIFIED SECTION FOR SIMILARITY FILTERING AND ORDERING ---
+        if self.show_only_similar_var.get():
+            if self._similarity_scan_done_for_current_folder and self.marked_similar_paths and self.similar_image_groups:
+                # "Show Only Similar" is ON, scan is done, and similar images were found.
+                # Reorder self.all_folder_items: folders first, then groups of similar images.
+
+                folders_in_view = [item for item in self.all_folder_items if item['type'] == 'folder']
+
+                # Create a lookup for quick access to item data from self.all_folder_items.
+                # This list (self.all_folder_items) has already been type-filtered by _apply_type_filters_to_items_list.
+                path_to_item_data_map = {item['path']: item for item in self.all_folder_items if item['type'] == 'file'}
+
+                grouped_similar_items_display_list = []
+
+                # Sort the groups themselves for a consistent order of groups.
+                # Each group is a set of paths. Sort by the first path in each (sorted) group.
+                sorted_similar_groups = sorted(
+                    list(self.similar_image_groups),
+                    key=lambda g: sorted(list(g))[0] if g else ""
+                )
+
+                for group_paths_set in sorted_similar_groups:
+                    current_group_batch = []
+                    # Sort paths within each group for consistent order of items within a group.
+                    for path in sorted(list(group_paths_set)):
+                        if path in path_to_item_data_map: # Ensure item is valid and passed type filters
+                            current_group_batch.append(path_to_item_data_map[path])
+
+                    if current_group_batch: # Only add if the group has items visible after type filtering
+                        grouped_similar_items_display_list.extend(current_group_batch)
+
+                self.all_folder_items = folders_in_view + grouped_similar_items_display_list
+            else:
+                # "Show Only Similar" is ON, but either scan not done, no similar paths marked, or no groups.
+                # In this case, show only folders. self.all_folder_items is already type-filtered.
+                self.all_folder_items = [item for item in self.all_folder_items if item['type'] == 'folder']
+        # else: (show_only_similar_var is OFF)
+            # self.all_folder_items is already correctly populated by _apply_type_filters_to_items_list().
+            # No special reordering for similarity is done here, but items will still be *styled* as similar.
+            # So, no specific 'else' block needed here; self.all_folder_items remains as is from type filtering.
+        if self.all_folder_items:
             self._load_next_batch_of_items()
-        else: 
+        else:
+            # Ensure canvas scroll region is updated even if no items
             self.item_frame.update_idletasks()
             self.canvas.configure(scrollregion=self.canvas.bbox("all"))
-        
+
         self.update_ui_state()
+
+    def _apply_type_filters_to_items_list(self):
+        """Filters all_folder_items_raw based on show_images_var and show_videos_var."""
+        temp_filtered_items = []
+        for item in self.all_folder_items_raw:
+            if item['type'] == 'folder':
+                temp_filtered_items.append(item)
+                continue
+            if item['type'] == 'file':
+                _, ext = os.path.splitext(item['name'])
+                ext_lower = ext.lower()
+                is_image = ext_lower in IMAGE_EXTENSIONS
+                is_video = ext_lower in VIDEO_EXTENSIONS
+
+                if (self.show_images_var.get() and is_image) or \
+                   (self.show_videos_var.get() and is_video):
+                    temp_filtered_items.append(item)
+        self.all_folder_items = temp_filtered_items
+
 
     def _load_next_batch_of_items(self):
         if self.is_loading_batch or self.displayed_item_count >= len(self.all_folder_items): return
         self.is_loading_batch = True
+
         start_index = self.displayed_item_count
         end_index = min(len(self.all_folder_items), start_index + LAZY_LOAD_BATCH_SIZE)
         items_for_this_batch = self.all_folder_items[start_index:end_index]
-        
-        if not items_for_this_batch: 
-            self.is_loading_batch = False; return
-            
+
+        if not items_for_this_batch:
+            self.is_loading_batch = False
+            return
+
         self._populate_grid_with_batch(items_for_this_batch)
-        self.displayed_item_count = end_index
-        
+        self.displayed_item_count = end_index # Update count of displayed items from all_folder_items
+
+        # Files to process for thumbnails in this batch
         files_to_process_this_batch = [item for item in items_for_this_batch if item['type'] == 'file']
         if files_to_process_this_batch:
-            thread = threading.Thread(target=self._thumbnail_generator_thread, 
-                                      args=(files_to_process_this_batch, self.cancel_long_operation), 
+            # Start a new thumbnail thread for this batch
+            # Cancel previous one if it was still running (already done in load_items)
+            thumb_thread = threading.Thread(target=self._thumbnail_generator_thread_runner,
+                                      args=(files_to_process_this_batch, self.cancel_long_operation),
                                       daemon=True)
-            self.active_thumbnail_thread = thread; thread.start()
-            
+            self.active_thumbnail_thread = thumb_thread # Store reference to the new thread
+            thumb_thread.start()
+
         self.is_loading_batch = False
-        self.root.after_idle(self.on_scroll_check_lazy_load)
+        self.root.after_idle(self.on_scroll_check_lazy_load) # Check if more can be loaded immediately
 
     def _populate_grid_with_batch(self, items_in_batch):
-        for item in items_in_batch:
-            widget_info = self._create_placeholder_widget(self.item_frame, item)
+        for item_data in items_in_batch:
+            widget_info = self._create_placeholder_widget(self.item_frame, item_data)
             widget_info['widget'].grid(row=self.current_grid_row, column=self.current_grid_col, padx=5, pady=5, sticky="nsew")
-            
-            for w in [widget_info['widget'], widget_info['thumb_label'], widget_info['name_label']]:
-                w.bind("<Button-1>", lambda e, p=item['path'], wf=widget_info['widget']: 
-                    self._on_item_click_for_selection(e, p, wf))
-                if item['type'] == 'folder':
-                    w.bind("<Double-Button-1>", lambda e, p=item['path']: self.navigate_to_folder(p))
-                elif item['type'] == 'file':
-                    if item['path'].lower().endswith(IMAGE_EXTENSIONS):
-                        w.bind("<Double-Button-1>", lambda e, p=item['path']: self._open_image_viewer_action(p))
-                    elif item['path'].lower().endswith(VIDEO_EXTENSIONS):
-                        w.bind("<Double-Button-1>", lambda e, p=item['path']: 
-                            self._open_video_viewer_action(p) if vlc else self._open_with_system(p))
-            
-            self.items_in_view[item['path']] = {**widget_info, 'type': item['type'], 'is_error': False}
-            self.current_grid_col += 1
-            if self.current_grid_col >= GRID_COLUMNS: 
-                self.current_grid_col = 0; self.current_grid_row += 1
 
-        for c in range(GRID_COLUMNS): self.item_frame.grid_columnconfigure(c, weight=1)
+            # Bindings for selection and double-click
+            # Path must be passed correctly to lambda
+            for widget_element in [widget_info['widget'], widget_info['thumb_label'], widget_info['name_label']]:
+                widget_element.bind("<Button-1>", lambda e, p=item_data['path'], wf=widget_info['widget']:
+                    self._on_item_click_for_selection(e, p, wf))
+
+                if item_data['type'] == 'folder':
+                    widget_element.bind("<Double-Button-1>", lambda e, p=item_data['path']: self.navigate_to_folder(p))
+                elif item_data['type'] == 'file':
+                    if item_data['path'].lower().endswith(IMAGE_EXTENSIONS):
+                        widget_element.bind("<Double-Button-1>", lambda e, p=item_data['path']: self._open_image_viewer_action(p))
+                    elif item_data['path'].lower().endswith(VIDEO_EXTENSIONS):
+                        widget_element.bind("<Double-Button-1>", lambda e, p=item_data['path']:
+                            self._open_video_viewer_action(p) if self.vlc else self._open_with_system(p))
+
+            self.items_in_view[item_data['path']] = {
+                **widget_info,  # Contains 'widget', 'thumb_label', 'name_label'
+                'type': item_data['type'],
+                'is_error': False # Initial state, updated by thumbnail processor
+            }
+
+            self.current_grid_col += 1
+            if self.current_grid_col >= GRID_COLUMNS:
+                self.current_grid_col = 0
+                self.current_grid_row += 1
+
+        for c_idx in range(GRID_COLUMNS): self.item_frame.grid_columnconfigure(c_idx, weight=1)
         self.item_frame.update_idletasks()
         self.canvas.configure(scrollregion=self.canvas.bbox("all"))
 
-    def _create_placeholder_widget(self, parent, item):
-        item_path, item_name, item_type = item['path'], item['name'], item['type']
-        initial_style_info = {'type': item_type, 'is_error': False}
-        style = self._get_item_style(item_path, initial_style_info)
 
-        widget_frame = ttk.Frame(parent, style=style, padding=3)
+    def _create_placeholder_widget(self, parent_frame, item_data):
+        item_path, item_name, item_type = item_data['path'], item_data['name'], item_data['type']
+
+        # Initial style determination (might be updated once thumbnail loads)
+        initial_style_info = {'type': item_type, 'is_error': False} # Base info for style
+        style_name = self._get_item_style(item_path, initial_style_info)
+
+        widget_frame = ttk.Frame(parent_frame, style=style_name, padding=3)
+
         thumb_label = ttk.Label(widget_frame, anchor='center')
-        thumb_label.pack(fill=tk.BOTH, expand=True)
+        thumb_label.pack(fill=tk.BOTH, expand=True) # Fill available space for thumb
+
         name_label = ttk.Label(widget_frame, text=item_name, anchor='center', wraplength=GRID_THUMBNAIL_SIZE[0]-10)
         name_label.pack(fill=tk.X, side=tk.BOTTOM)
 
-        if item_type == 'folder': 
-            thumb_label.config(text="FOLDER", font=("Arial", 10, "bold"))
-        else: 
+        if item_type == 'folder':
+            thumb_label.config(text="FOLDER", font=("Arial", 10, "bold")) # Placeholder text
+        else: # For files
             thumb_label.config(text=LOADING_TEXT, font=("Arial", 10))
-        
+
         return {'widget': widget_frame, 'thumb_label': thumb_label, 'name_label': name_label}
 
+    # --- Thumbnail Generation & Processing ---
+    def _thumbnail_generator_thread_runner(self, items_to_process_batch, cancel_event_ref):
+        """
+        Thread worker that iterates through a batch of items and generates thumbnails.
+        Uses file_operations.generate_single_thumbnail.
+        """
+        for item_data in items_to_process_batch:
+            if cancel_event_ref.is_set():
+                # print(f"Thumbnail generation cancelled for batch.")
+                break # Exit if cancellation is requested
+
+            # Call the core thumbnail generation function from file_operations
+            thumb_image, error_flag = file_operations.generate_single_thumbnail(
+                item_data,
+                GRID_THUMBNAIL_SIZE,
+                self.Image, # Pass PIL.Image
+                self.UnidentifiedImageError, # Pass PIL.UnidentifiedImageError
+                self.cv2     # Pass cv2 module
+            )
+
+            # Add to queue for UI update in main thread
+            self.thumbnail_queue.put({
+                'path': item_data['path'],
+                'image': thumb_image,
+                'error': error_flag,
+                'type': item_data['type'] # Keep type for context if needed
+            })
+        # print(f"Thumbnail thread finished for a batch.")
+
+
+    def _process_thumbnail_queue(self):
+        max_updates_per_cycle = 10 # Limit updates per call to keep UI responsive
+        processed_count = 0
+        try:
+            while not self.thumbnail_queue.empty() and processed_count < max_updates_per_cycle:
+                result = self.thumbnail_queue.get_nowait()
+                processed_count += 1
+
+                item_path = result['path']
+                if item_path in self.items_in_view:
+                    widget_info = self.items_in_view[item_path]
+                    widget_frame = widget_info['widget']
+                    thumb_display_label = widget_info['thumb_label'] # This is the ttk.Label for the image
+
+                    # Update error state based on thumbnail generation result
+                    widget_info['is_error'] = result['error']
+
+                    if widget_frame.winfo_exists() and thumb_display_label.winfo_exists():
+                        # Get the correct style based on new error state, selection, similarity
+                        final_style = self._get_item_style(item_path, widget_info)
+                        widget_frame.configure(style=final_style)
+
+                        if result['error']:
+                            thumb_display_label.config(image='', text="Error", font=("Arial", 9, "bold"), foreground="red")
+                            if hasattr(thumb_display_label, 'image_ref'): # Keep PhotoImage ref
+                                thumb_display_label.image_ref = None
+                        elif result['image']: # Successfully generated PIL image
+                            try:
+                                 tk_image = self.ImageTk.PhotoImage(result['image'])
+                                 thumb_display_label.image_ref = tk_image # Store reference
+                                 thumb_display_label.config(image=tk_image, text="")
+                            except Exception as e_tk: # Error converting PIL to Tk PhotoImage
+                                 print(f"Tkinter PhotoImage error for {item_path}: {e_tk}")
+                                 thumb_display_label.config(image='', text="Display Err", font=("Arial", 8))
+                                 widget_info['is_error'] = True # Mark as error for styling
+                                 widget_frame.configure(style=self._get_item_style(item_path, widget_info))
+                                 if hasattr(thumb_display_label, 'image_ref'):
+                                     thumb_display_label.image_ref = None
+                        else: # No image generated, but not an error (e.g., video without cv2, or non-media file)
+                            if item_path.lower().endswith(VIDEO_EXTENSIONS):
+                                thumb_display_label.config(image='', text="📹 Video", font=("Arial", 10, "bold"))
+                            # Could add more specific placeholders for other file types if needed
+                            if hasattr(thumb_display_label, 'image_ref'):
+                                thumb_display_label.image_ref = None
+        except queue.Empty:
+            pass # No items in queue
+        except Exception as e:
+            print(f"Error processing thumbnail queue: {e}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            self.root.after(100, self._process_thumbnail_queue) # Schedule next check
+
+
+    # --- UI Update & State Management ---
     def clear_view(self):
-        for widget_info in self.items_in_view.values():
-            if widget_info['widget'].winfo_exists(): widget_info['widget'].destroy()
-        self.items_in_view.clear(); self.selected_item_paths.clear(); self.reset_preview()
-        self.canvas.yview_moveto(0); self.canvas.xview_moveto(0)
-        self.item_frame.update_idletasks(); self.canvas.configure(scrollregion=self.canvas.bbox("all"))
-        self.displayed_item_count = 0; self.current_grid_row = 0; self.current_grid_col = 0
-        self.is_loading_batch = False
+        for item_path_in_view in list(self.items_in_view.keys()): # Iterate over keys copy
+            widget_info = self.items_in_view.pop(item_path_in_view, None)
+            if widget_info and widget_info['widget'].winfo_exists():
+                widget_info['widget'].destroy()
+
+        self.items_in_view.clear()
+        self.selected_item_paths.clear()
+        self.reset_preview()
+
+        # Reset grid layout counters
+        self.displayed_item_count = 0
+        self.current_grid_row = 0
+        self.current_grid_col = 0
+        self.is_loading_batch = False # Ensure this is reset
+
+        # Reset canvas scroll position and region
+        self.canvas.yview_moveto(0)
+        self.canvas.xview_moveto(0)
+        self.item_frame.update_idletasks() # Ensure item_frame size is calculated if empty
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
 
     def _clear_all_selection_visuals(self):
+        # Iterate over a copy of selected_item_paths in case it's modified elsewhere (though unlikely here)
         paths_to_restyle = list(self.selected_item_paths)
-        for path in paths_to_restyle:
-            if path in self.items_in_view:
-                info = self.items_in_view[path]; widget = info['widget']
+        for path_to_clear_sel in paths_to_restyle:
+            if path_to_clear_sel in self.items_in_view:
+                info = self.items_in_view[path_to_clear_sel]
+                widget = info['widget']
                 if widget.winfo_exists():
-                    style = self._get_item_style(path, info) 
-                    try: widget.configure(style=style)
-                    except tk.TclError: pass
+                    # Get style WITHOUT selection, but considering other states (error, similar, type)
+                    style_name = self._get_item_style(path_to_clear_sel, info, force_deselected=True)
+                    try:
+                        widget.configure(style=style_name)
+                    except tk.TclError: # Handle if widget is destroyed mid-operation
+                        pass
 
-    def _on_item_click_for_selection(self, event, item_path, widget_frame):
-        self._clear_all_selection_visuals() 
-        self.selected_item_paths = {item_path} 
-        if widget_frame.winfo_exists(): 
-            style = self._get_item_style(item_path, self.items_in_view[item_path])
-            widget_frame.configure(style=style)
-        self.update_preview_and_info(); self.update_ui_state()
+    def _get_item_style(self, item_path, item_info, force_deselected=False):
+        is_selected = (item_path in self.selected_item_paths) and not force_deselected
+        is_similar = item_path in self.marked_similar_paths # Assumes marked_similar_paths is current
+        is_error = item_info.get('is_error', False)
+        item_type = item_info['type']
 
-    def reset_preview(self): 
-        # print("DEBUG_PREVIEW: reset_preview called")
+        if is_selected: return "Selected.TFrame"
+        # Similar style only applies if not selected, and item is a file
+        if is_similar and item_type == 'file': return "Similar.TFrame"
+
+        if item_type == 'folder': return "Folder.TFrame"
+        elif item_type == 'file':
+            if is_error: return "Error.TFrame"
+            # Check if a thumbnail image is actually displayed on the label
+            has_thumb_image_displayed = False
+            if 'thumb_label' in item_info and item_info['thumb_label'].winfo_exists():
+                # Check if the label has an image attribute and it's set
+                if hasattr(item_info['thumb_label'], 'image_ref') and item_info['thumb_label'].image_ref:
+                    has_thumb_image_displayed = True
+
+            return "ItemLoaded.TFrame" if has_thumb_image_displayed else "Item.TFrame" # Item.TFrame is placeholder
+        return "Item.TFrame" # Default fallback
+
+    def _on_item_click_for_selection(self, event, item_path_clicked, widget_frame_clicked):
+        # Handle Ctrl/Shift for multi-selection later if desired. For now, single selection.
+
+        # First, clear visuals of previously selected items
+        self._clear_all_selection_visuals()
+
+        # Then, set the new selection
+        self.selected_item_paths = {item_path_clicked} # Replace current selection
+
+        # Apply 'selected' style to the newly clicked item's frame
+        if item_path_clicked in self.items_in_view and widget_frame_clicked.winfo_exists():
+            item_info = self.items_in_view[item_path_clicked]
+            style_name = self._get_item_style(item_path_clicked, item_info) # This will now include "Selected.TFrame"
+            widget_frame_clicked.configure(style=style_name)
+
+        self.update_preview_and_info()
+        self.update_ui_state()
+
+    def reset_preview(self):
         self.preview_label.config(image='', text="Select an item", background="lightgrey")
-        self.preview_image_obj = None 
+        if hasattr(self.preview_label, 'image_ref'): self.preview_label.image_ref = None
+        self.preview_image_obj = None # Deprecate in favor of image_ref on label itself
+
         self.info_name_label.config(text="Name: -")
         self.info_size_label.config(text="Size: -")
         self.info_type_label.config(text="Type: -")
 
-    def update_preview_and_info(self): 
-        if not self.selected_item_paths: 
+    def update_preview_and_info(self):
+        if not self.selected_item_paths:
             self.reset_preview()
             return
 
         if len(self.selected_item_paths) == 1:
             item_path = list(self.selected_item_paths)[0]
-            item_info = self.items_in_view.get(item_path) 
-            
-            # print(f"DEBUG_PREVIEW: Updating for single item: {item_path}") 
+            item_info = self.items_in_view.get(item_path)
 
             if not item_info or not os.path.exists(item_path):
-                # print(f"DEBUG_PREVIEW: Item not in view or does not exist: {item_path}") 
                 self.reset_preview()
                 self.info_name_label.config(text="Name: Error/Not Found")
                 return
@@ -660,853 +739,305 @@ class PhotoVideoManagerApp:
             self.info_name_label.config(text=f"Name: {file_name}")
             self.info_type_label.config(text=f"Type: {item_type.capitalize()}")
 
+            preview_bg_color_default = ttk.Style().lookup("TFrame", "background") # Default background
+
             if item_type == 'file':
                 try:
                     size_bytes = os.path.getsize(item_path)
-                    self.info_size_label.config(text=f"Size: {size_bytes/(1024*1024):.2f}MB" if size_bytes > 1024*1024 else f"{size_bytes/1024:.1f}KB")
-                    
-                    # Default to lightgrey, change if image/video thumb is successful
-                    preview_bg_color = "lightgrey" 
-                    preview_text = "No preview"
+                    size_mb = size_bytes / (1024*1024)
+                    size_kb = size_bytes / 1024
+                    self.info_size_label.config(text=f"Size: {size_mb:.2f} MB" if size_mb >= 1.0 else f"{size_kb:.1f} KB")
+
+                    preview_text_content = "No preview available"
+                    preview_final_bg = preview_bg_color_default
+                    generated_preview_image = None
 
                     if item_path.lower().endswith(IMAGE_EXTENSIONS):
-                        # print(f"DEBUG_PREVIEW: Is image file for preview: {item_path}") 
-                        img_raw = Image.open(item_path)
-                        img_prev = img_raw.copy()
-                        # print(f"DEBUG_PREVIEW: Opened with Pillow for preview. Mode: {img_prev.mode}, Size: {img_prev.size}") 
-                        
-                        img_prev.thumbnail(PREVIEW_THUMBNAIL_SIZE, Image.Resampling.LANCZOS) 
-                        # print(f"DEBUG_PREVIEW: Thumbnail for preview generated. New size: {img_prev.size}") 
-                        
-                        if img_prev.mode not in ('RGB','RGBA'): 
-                            img_prev = img_prev.convert('RGB')
-                            # print(f"DEBUG_PREVIEW: Converted to RGB for preview. New mode: {img_prev.mode}") 
-                        
-                        self.preview_image_obj = ImageTk.PhotoImage(img_prev) 
-                        # print("DEBUG_PREVIEW: ImageTk.PhotoImage for preview created.") 
-                        
-                        self.preview_label.config(image=self.preview_image_obj, text="")
-                        # Use a theme-appropriate background for images, or a specific one like IMAGE_VIEWER_BG
-                        # For now, let's use the container's default or a neutral color
-                        style = ttk.Style()
-                        preview_bg_color = style.lookup("TFrame", "background") # Get default TFrame background
-                        # print("DEBUG_PREVIEW: Preview label configured with image.") 
+                        img_pil_preview = self.Image.open(item_path)
+                        img_pil_preview.thumbnail(PREVIEW_THUMBNAIL_SIZE, self.Image.Resampling.LANCZOS)
+                        if img_pil_preview.mode not in ('RGB','RGBA'): img_pil_preview = img_pil_preview.convert('RGB')
+                        generated_preview_image = self.ImageTk.PhotoImage(img_pil_preview)
+                        preview_text_content = "" # Clear text if image is shown
+                        # preview_final_bg = IMAGE_VIEWER_BG # Optional: use specific bg for images
 
-                    elif item_path.lower().endswith(VIDEO_EXTENSIONS) and cv2:
-                        # print(f"DEBUG_PREVIEW: Is video file for preview: {item_path}")
+                    elif item_path.lower().endswith(VIDEO_EXTENSIONS) and self.cv2:
                         cap = None
                         try:
-                            cap = cv2.VideoCapture(item_path)
+                            cap = self.cv2.VideoCapture(item_path)
                             if cap.isOpened():
-                                frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                                frame_count = int(cap.get(self.cv2.CAP_PROP_FRAME_COUNT))
                                 frame_no = min(frame_count // 10, 100) if frame_count > 10 else 0
-                                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_no)
+                                cap.set(self.cv2.CAP_PROP_POS_FRAMES, frame_no)
                                 ret, frame = cap.read()
                                 if ret:
-                                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                                    img = Image.fromarray(frame_rgb)
-                                    img.thumbnail(PREVIEW_THUMBNAIL_SIZE, Image.Resampling.LANCZOS)
-                                    self.preview_image_obj = ImageTk.PhotoImage(img)
-                                    self.preview_label.config(image=self.preview_image_obj, text="")
-                                    style = ttk.Style()
-                                    preview_bg_color = style.lookup("TFrame", "background")
-                                    preview_text = "" # Clear text if image shown
-                                    # print("DEBUG_PREVIEW: Video thumbnail for preview created and set.")
-                                else:
-                                    # print(f"DEBUG_PREVIEW: Video thumbnail - cap.read() failed for {item_path}")
-                                    preview_text = "Video (no thumb)"
-                            else:
-                                # print(f"DEBUG_PREVIEW: Video thumbnail - cap.isOpened() failed for {item_path}")
-                                preview_text = "Video (no thumb)"
-                        except Exception as e_vid_preview:
-                            print(f"DEBUG_PREVIEW: Error generating video preview for {item_path}: {e_vid_preview}")
-                            preview_text = "Video (thumb error)"
-                            preview_bg_color = ERROR_COLOR # Indicate error
+                                    frame_rgb = self.cv2.cvtColor(frame, self.cv2.COLOR_BGR2RGB)
+                                    img_pil_video_thumb = self.Image.fromarray(frame_rgb)
+                                    img_pil_video_thumb.thumbnail(PREVIEW_THUMBNAIL_SIZE, self.Image.Resampling.LANCZOS)
+                                    generated_preview_image = self.ImageTk.PhotoImage(img_pil_video_thumb)
+                                    preview_text_content = ""
+                                else: preview_text_content = "Video (thumb failed)"
+                            else: preview_text_content = "Video (cannot open)"
+                        except Exception as e_vid_prev:
+                            print(f"Video preview error for {item_path}: {e_vid_prev}")
+                            preview_text_content = "Video (thumb error)"
+                            preview_final_bg = ERROR_COLOR
                         finally:
                             if cap: cap.release()
-                    
-                    self.preview_label.config(text=preview_text, background=preview_bg_color)
-                    if not self.preview_image_obj: # If no image was set (e.g. video thumb failed or not image)
-                         self.preview_label.config(image='')
 
+                    self.preview_label.config(text=preview_text_content, background=preview_final_bg)
+                    if generated_preview_image:
+                        self.preview_label.config(image=generated_preview_image)
+                        self.preview_label.image_ref = generated_preview_image # Keep ref
+                    else:
+                        self.preview_label.config(image='')
+                        if hasattr(self.preview_label, 'image_ref'): self.preview_label.image_ref = None
 
-                except UnidentifiedImageError:
-                    # print(f"DEBUG_PREVIEW: UnidentifiedImageError for preview {item_path}") 
-                    self.preview_label.config(image='',text="Preview Error (Format?)", background=ERROR_COLOR)
-                    self.preview_image_obj=None
-                except Exception as e:
-                    # print(f"DEBUG_PREVIEW: Error updating preview for {item_path}: {e}") 
-                    # import traceback; traceback.print_exc() 
-                    self.preview_label.config(image='',text="Preview Error", background=ERROR_COLOR) 
-                    self.preview_image_obj=None
+                except self.UnidentifiedImageError:
+                    self.preview_label.config(image='', text="Preview Error (Format?)", background=ERROR_COLOR)
+                    if hasattr(self.preview_label, 'image_ref'): self.preview_label.image_ref = None
+                except Exception as e_prev:
+                    print(f"Error updating preview for {item_path}: {e_prev}")
+                    self.preview_label.config(image='', text="Preview Error", background=ERROR_COLOR)
+                    if hasattr(self.preview_label, 'image_ref'): self.preview_label.image_ref = None
+
             elif item_type == 'folder':
-                # print(f"DEBUG_PREVIEW: Item is a folder: {item_path}") 
-                self.info_size_label.config(text="Size: -")
-                self.preview_label.config(image='', text="Folder Selected", background="lightgrey")
-                self.preview_image_obj=None
-        else: 
-            # print(f"DEBUG_PREVIEW: Multiple items selected ({len(self.selected_item_paths)})") 
-            self.preview_label.config(image='', text=f"{len(self.selected_item_paths)} items selected", background="lightgrey")
-            self.preview_image_obj=None
+                self.info_size_label.config(text="Size: -") # Folders don't show size here
+                self.preview_label.config(image='', text="Folder Selected", background=preview_bg_color_default)
+                if hasattr(self.preview_label, 'image_ref'): self.preview_label.image_ref = None
+        else: # Multiple items selected
+            self.preview_label.config(image='', text=f"{len(self.selected_item_paths)} items selected", background=preview_bg_color_default)
+            if hasattr(self.preview_label, 'image_ref'): self.preview_label.image_ref = None
             self.info_name_label.config(text="Name: Multiple items")
-            self.info_size_label.config(text="Size: -"); self.info_type_label.config(text="Type: Mixed")
-
-    def _open_image_viewer_action(self, image_path_to_open):
-        all_images_in_current_folder = [
-            item['path'] for item in self.all_folder_items_raw 
-            if item['type'] == 'file' and item['path'].lower().endswith(IMAGE_EXTENSIONS) and os.path.exists(item['path'])
-        ]
-        if not all_images_in_current_folder:
-            if os.path.exists(image_path_to_open): all_images_in_current_folder = [image_path_to_open]
-            else: messagebox.showinfo("Viewer", "No images to view."); return
-        
-        try: current_idx = all_images_in_current_folder.index(image_path_to_open)
-        except ValueError:
-            if os.path.exists(image_path_to_open):
-                all_images_in_current_folder.append(image_path_to_open)
-                current_idx = len(all_images_in_current_folder) -1
-            else: messagebox.showerror("Error", "Cannot find image for viewer."); return
-        ImageViewerWindow(self.root, all_images_in_current_folder, current_idx, self)
-
-    def _open_video_viewer_action(self, video_path_to_open):
-        all_videos_in_current_folder = [
-            item['path'] for item in self.all_folder_items_raw 
-            if item['type'] == 'file' and item['path'].lower().endswith(VIDEO_EXTENSIONS) and os.path.exists(item['path'])
-        ]
-        if not all_videos_in_current_folder:
-            if os.path.exists(video_path_to_open): all_videos_in_current_folder = [video_path_to_open]
-            else: messagebox.showinfo("Viewer", "No videos to view."); return
-        
-        try: current_idx = all_videos_in_current_folder.index(video_path_to_open)
-        except ValueError:
-            if os.path.exists(video_path_to_open):
-                all_videos_in_current_folder.append(video_path_to_open)
-                current_idx = len(all_videos_in_current_folder) - 1
-            else: messagebox.showerror("Error", "Cannot find video for viewer."); return
-        VideoViewerWindow(self.root, all_videos_in_current_folder, current_idx, self)
-
-    def open_selected_item_action(self):
-        if not self.selected_item_paths or len(self.selected_item_paths) != 1: return
-        item_path = list(self.selected_item_paths)[0]
-        item_info = self.items_in_view.get(item_path)
-        if not item_info or not os.path.exists(item_path): return
-        
-        item_type = item_info['type']
-        if item_type == 'folder': self.navigate_to_folder(item_path)
-        elif item_type == 'file':
-            if item_path.lower().endswith(IMAGE_EXTENSIONS): self._open_image_viewer_action(item_path)
-            elif item_path.lower().endswith(VIDEO_EXTENSIONS):
-                if vlc: self._open_video_viewer_action(item_path)
-                else: self._open_with_system(item_path)
-            else: self._open_with_system(item_path)
-
-    def _open_with_system(self, path):
-        try:
-            if sys.platform == "win32": os.startfile(path)
-            elif sys.platform == "darwin": subprocess.Popen(["open", path])
-            else: subprocess.Popen(["xdg-open", path])
-        except Exception as e: messagebox.showerror("Error", f"Could not open: {e}")
-
-    def _add_to_undo_stack(self, action_type, **kwargs):
-        self.undo_stack.append({'action_type': action_type, **kwargs})
-        self.update_ui_state()
-
-    def _undo_last_action(self): # MODIFIED to attempt scroll restoration
-        if not self.undo_stack: return
-        
-        current_scroll_y = self.canvas.yview()[0]
-        current_scroll_x = self.canvas.xview()[0]
-
-        last_action = self.undo_stack.pop()
-        action_type = last_action['action_type']
-        restored_count = 0
-        try:
-            if action_type == 'delete_items':
-                for original_path, trashed_path in last_action['items']:
-                    if os.path.exists(trashed_path):
-                        os.makedirs(os.path.dirname(original_path), exist_ok=True)
-                        shutil.move(trashed_path, original_path)
-                        restored_count +=1
-                if restored_count > 0:
-                    messagebox.showinfo("Undo", f"Restored {restored_count} item(s).")
-        except Exception as e: 
-            messagebox.showerror("Undo Error", f"Could not undo: {e}")
-
-        self.load_items(self.current_folder.get()) 
-        
-        self.canvas.update_idletasks() 
-        self.canvas.yview_moveto(current_scroll_y)
-        self.canvas.xview_moveto(current_scroll_x)
-        
-        self.update_ui_state() 
-
-    def on_delete_key_press(self, event=None):
-        self.delete_selected_items_action()
-
-    def delete_selected_items_action(self, items_to_delete_override=None, from_viewer=False): # MODIFIED
-        paths_to_process = items_to_delete_override if items_to_delete_override else self.selected_item_paths.copy()
-        if not paths_to_process: 
-            return False
-
-        deleted_for_undo = []
-        actually_deleted_count = 0
-        items_visually_removed = False
-
-        current_scroll_y = self.canvas.yview()[0] 
-        current_scroll_x = self.canvas.xview()[0]
-
-        for item_path in list(paths_to_process): 
-            trashed_path_for_undo = None
-            if os.path.exists(item_path):
-                item_name = os.path.basename(item_path)
-                try:
-                    trashed_filename = f"{int(time.time())}_{item_name}"
-                    actual_trashed_path = os.path.join(self.TRASH_DIR, trashed_filename)
-                    
-                    self.root.config(cursor="watch"); self.root.update_idletasks()
-                    shutil.move(item_path, actual_trashed_path)
-                    self.root.config(cursor="")
-                    
-                    trashed_path_for_undo = actual_trashed_path 
-                    deleted_for_undo.append((item_path, trashed_path_for_undo))
-                    actually_deleted_count += 1
-                except Exception as e:
-                    self.root.config(cursor="")
-                    messagebox.showerror("Delete Error", f"Could not move '{item_name}' to trash:\n{e}")
-                    continue 
-            
-            if item_path in self.items_in_view:
-                widget_info = self.items_in_view.pop(item_path)
-                if widget_info['widget'].winfo_exists():
-                    widget_info['widget'].destroy()
-                items_visually_removed = True
-            
-            if item_path in self.selected_item_paths:
-                self.selected_item_paths.discard(item_path)
-            
-            self.all_folder_items_raw = [item for item in self.all_folder_items_raw if item['path'] != item_path]
-            self.all_folder_items = [item for item in self.all_folder_items if item['path'] != item_path]
-            
-            if item_path in self.marked_similar_paths:
-                self.marked_similar_paths.discard(item_path)
-            for group in self.similar_image_groups:
-                group.discard(item_path)
-            self.similar_image_groups = [g for g in self.similar_image_groups if len(g) > 1]
-        
-        if deleted_for_undo: 
-            self._add_to_undo_stack('delete_items', items=deleted_for_undo)
-        
-        if not from_viewer: 
-            if items_visually_removed:
-                self.displayed_item_count = len(self.items_in_view) 
-                
-                self.item_frame.update_idletasks() 
-                self.on_frame_configure() 
-
-                self.canvas.yview_moveto(current_scroll_y)
-                self.canvas.xview_moveto(current_scroll_x)
-
-                self.root.after_idle(self.on_scroll_check_lazy_load)
-
-            self.update_preview_and_info() 
-            self.update_ui_state() 
-
-        return actually_deleted_count > 0
-
-    def _get_errored_item_paths(self):
-        return [path for path, info in self.items_in_view.items() if info.get('is_error') and os.path.exists(path)]
-
-    def _delete_all_errored_action(self):
-        errored_paths = self._get_errored_item_paths()
-        if not errored_paths: messagebox.showinfo("Info", "No errored items found."); return
-        if messagebox.askyesno("Confirm Delete Errored", f"Delete {len(errored_paths)} errored item(s)? (Undoable)", icon='warning'):
-            self.delete_selected_items_action(items_to_delete_override=set(errored_paths))
-
-    def _move_all_errored_action(self):
-        errored_paths = self._get_errored_item_paths()
-        if not errored_paths: messagebox.showinfo("Info", "No errored items found."); return
-        dest_folder = filedialog.askdirectory(title=f"Move {len(errored_paths)} errored item(s) to:", mustexist=True)
-        if dest_folder and os.path.isdir(dest_folder):
-            moved_count = 0
-            for item_path in errored_paths:
-                item_name = os.path.basename(item_path)
-                dest_path = os.path.join(dest_folder, item_name)
-                try:
-                    if os.path.exists(dest_path): continue 
-                    self.root.config(cursor="watch"); self.root.update_idletasks()
-                    shutil.move(item_path, dest_path) 
-                    moved_count += 1
-                except Exception as e: messagebox.showerror("Move Error", f"Could not move '{item_name}':\n{e}"); break
-            self.root.config(cursor="")
-            if moved_count > 0: messagebox.showinfo("Success", f"{moved_count} item(s) moved."); self.load_items(self.current_folder.get())
+            self.info_size_label.config(text="Size: -")
+            self.info_type_label.config(text="Type: Mixed")
 
     def update_ui_state(self):
+        # Up button
         self.up_button.config(state=tk.NORMAL if self.folder_history else tk.DISABLED)
+
         num_selected = len(self.selected_item_paths)
         can_open_single = num_selected == 1
         can_delete_any = num_selected > 0
-        
+
+        # Action buttons
         self.open_button.config(state=tk.NORMAL if can_open_single else tk.DISABLED)
         self.delete_button.config(state=tk.NORMAL if can_delete_any else tk.DISABLED)
-        
+
+        # Undo functionality
         undo_state = tk.NORMAL if self.undo_stack else tk.DISABLED
         self.undo_button.config(state=undo_state)
-        if hasattr(self, 'edit_menu'):
-            self.edit_menu.entryconfigure("Undo", state=undo_state)
+        if hasattr(self, 'edit_menu'): # Check if menu exists
+            try:
+                self.edit_menu.entryconfigure("Undo", state=undo_state)
+            except tk.TclError: # Menu might not be fully initialized yet or destroyed
+                pass
 
-    def handle_show_similar_toggle(self):
-        if self.show_only_similar_var.get() and not self._similarity_scan_done_for_current_folder and not self.is_finding_similar:
-            if imagehash:
-                self.status_label.config(text="Auto-scan for similar...")
-                self._find_similar_images_action(triggered_by_filter_toggle=True)
+
+    # --- Item Actions (Open, Delete via key) ---
+    def _open_image_viewer_action(self, image_path_to_open):
+        # Collect all *currently visible and valid* images from self.all_folder_items
+        # This list respects the current type (image/video) filters.
+        all_images_in_current_view = [
+            item['path'] for item in self.all_folder_items # Use filtered list for viewer context
+            if item['type'] == 'file' and item['path'].lower().endswith(IMAGE_EXTENSIONS) and os.path.exists(item['path'])
+        ]
+        if not all_images_in_current_view:
+            if os.path.exists(image_path_to_open) and image_path_to_open.lower().endswith(IMAGE_EXTENSIONS):
+                 all_images_in_current_view = [image_path_to_open] # Fallback if only the clicked one is valid
             else:
-                messagebox.showwarning("ImageHash Missing", "ImageHash library not found. Cannot find similar images.", parent=self.root)
-                self.show_only_similar_var.set(False)
+                messagebox.showinfo("Viewer", "No suitable images to view in the current filter context.", parent=self.root)
                 return
+
+        try:
+            current_idx = all_images_in_current_view.index(image_path_to_open)
+        except ValueError: # If the double-clicked item isn't in the filtered list (should not happen if logic is correct)
+            if os.path.exists(image_path_to_open) and image_path_to_open.lower().endswith(IMAGE_EXTENSIONS):
+                # This case is tricky: if it was filtered out, should we add it?
+                # For now, let's assume if it was double-clicked, it should be viewable if it's an image.
+                # A cleaner approach might be to ensure _populate_grid_with_batch only uses self.all_folder_items.
+                all_images_in_current_view.append(image_path_to_open) # Add it if valid but not found
+                current_idx = len(all_images_in_current_view) - 1
+            else:
+                messagebox.showerror("Error", "Cannot find the selected image for the viewer.", parent=self.root)
+                return
+        ImageViewerWindow(self.root, all_images_in_current_view, current_idx, self)
+
+    def _open_video_viewer_action(self, video_path_to_open):
+        # Similar logic to image viewer for collecting video paths
+        all_videos_in_current_view = [
+            item['path'] for item in self.all_folder_items
+            if item['type'] == 'file' and item['path'].lower().endswith(VIDEO_EXTENSIONS) and os.path.exists(item['path'])
+        ]
+        if not all_videos_in_current_view:
+            if os.path.exists(video_path_to_open) and video_path_to_open.lower().endswith(VIDEO_EXTENSIONS):
+                all_videos_in_current_view = [video_path_to_open]
+            else:
+                messagebox.showinfo("Viewer", "No suitable videos to view in the current filter context.", parent=self.root)
+                return
+
+        try:
+            current_idx = all_videos_in_current_view.index(video_path_to_open)
+        except ValueError:
+            if os.path.exists(video_path_to_open) and video_path_to_open.lower().endswith(VIDEO_EXTENSIONS):
+                all_videos_in_current_view.append(video_path_to_open)
+                current_idx = len(all_videos_in_current_view) - 1
+            else:
+                messagebox.showerror("Error", "Cannot find the selected video for the viewer.", parent=self.root)
+                return
+        VideoViewerWindow(self.root, all_videos_in_current_view, current_idx, self)
+
+
+    def open_selected_item_action(self): # Invoked by "Open/View" button
+        if not self.selected_item_paths or len(self.selected_item_paths) != 1: return
+        item_path = list(self.selected_item_paths)[0]
+
+        # Get info from items_in_view, not all_folder_items, as it's about the *displayed* item
+        item_info_from_view = self.items_in_view.get(item_path)
+        if not item_info_from_view or not os.path.exists(item_path):
+            messagebox.showerror("Error", "Selected item not found or no longer exists.", parent=self.root)
+            # Optionally, refresh view if item is missing
+            # self.load_items(self.current_folder.get())
+            return
+
+        item_type = item_info_from_view['type']
+        if item_type == 'folder':
+            self.navigate_to_folder(item_path)
+        elif item_type == 'file':
+            if item_path.lower().endswith(IMAGE_EXTENSIONS):
+                self._open_image_viewer_action(item_path)
+            elif item_path.lower().endswith(VIDEO_EXTENSIONS):
+                if self.vlc: # Check if VLC library is available
+                    self._open_video_viewer_action(item_path)
+                else:
+                    self._open_with_system(item_path) # Fallback if VLC not present
+            else: # Other file types
+                self._open_with_system(item_path)
+
+    def _open_with_system(self, path_to_open):
+        try:
+            if sys.platform == "win32":
+                os.startfile(os.path.realpath(path_to_open)) # realpath for symlinks
+            elif sys.platform == "darwin": # macOS
+                subprocess.Popen(["open", path_to_open])
+            else: # Linux and other Unix-like
+                subprocess.Popen(["xdg-open", path_to_open])
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not open file/folder with system default: {e}", parent=self.root)
+
+    def on_delete_key_press(self, event=None):
+        # This now calls the entry point which then calls the action_handler
+        self.delete_selected_items_action_entry()
+
+    # --- Undo Stack Management ---
+    def _add_to_undo_stack(self, action_type_str, **kwargs_action_data):
+        self.undo_stack.append({'action_type': action_type_str, **kwargs_action_data})
+        self.update_ui_state() # Update Undo button state
+
+
+    # --- Filtering and View Refresh ---
+    def handle_show_similar_toggle(self):
+        # If "Show Only Similar" is Toggled ON AND a scan hasn't been done for this folder
+        if self.show_only_similar_var.get() and not self._similarity_scan_done_for_current_folder and not self.is_finding_similar:
+            if self.imagehash: # Check if library is available
+                self.status_label.config(text="Auto-scan for similar...")
+                # Call the entry point for finding similar images
+                self._find_similar_images_action_entry(triggered_by_filter_toggle=True)
+            else:
+                messagebox.showwarning("ImageHash Missing", "ImageHash library not found. Cannot find/show similar images.", parent=self.root)
+                self.show_only_similar_var.set(False) # Revert toggle
+                return # Don't proceed to refresh
         else:
+            # If toggled OFF, or scan already done, or scan in progress (will refresh on completion)
+            # Just apply all filters and refresh the view.
             self.apply_all_filters_and_refresh()
 
-    def apply_all_filters_and_refresh(self): # This will still cause a full reload
+    def apply_all_filters_and_refresh(self):
+        # This method re-triggers load_items which will:
+        # 1. Re-scan the directory (for self.all_folder_items_raw)
+        # 2. Apply type filters (show_images_var, show_videos_var)
+        # 3. Apply similarity filter (show_only_similar_var) if active and data available
+        # 4. Reload the grid display.
+
         current_scroll_y = self.canvas.yview()[0]
         current_scroll_x = self.canvas.xview()[0]
-        
-        current_folder = self.current_folder.get()
-        if os.path.isdir(current_folder):
-            self.load_items(current_folder) # Full reload for filter changes
-        
-        self.canvas.update_idletasks()
+
+        current_folder_path = self.current_folder.get()
+        if os.path.isdir(current_folder_path): # Ensure current folder is valid
+            self.load_items(current_folder_path)
+        else:
+            # Handle case where current folder is no longer valid (e.g., "No folder selected")
+            self.clear_view()
+            self.update_ui_state()
+
+        # Attempt to restore scroll position after reload
+        self.canvas.update_idletasks() # Ensure canvas is up-to-date
         self.canvas.yview_moveto(current_scroll_y)
         self.canvas.xview_moveto(current_scroll_x)
+
         self._was_filter_active_before_style_refresh = self.show_only_similar_var.get()
 
-    def _find_similar_images_action(self, triggered_by_filter_toggle=False):
-        if imagehash is None:
-            if not triggered_by_filter_toggle:
-                messagebox.showerror("Error", "The 'imagehash' library is required for this feature.\nPlease install it: pip install imagehash", parent=self.root)
-            return
-        if self.is_finding_similar:
-            if not triggered_by_filter_toggle:
-                messagebox.showinfo("Info", "Already searching for similar images.", parent=self.root)
-            return
-        
-        image_items = [item for item in self.all_folder_items_raw if item['type'] == 'file' and item['path'].lower().endswith(IMAGE_EXTENSIONS)]
-        if not image_items:
-            if not triggered_by_filter_toggle:
-                messagebox.showinfo("Info", "No images in the current folder to compare.", parent=self.root)
-            self.status_label.config(text="No images to compare.")
-            self._similarity_scan_done_for_current_folder = True
-            if triggered_by_filter_toggle:
-                self.show_only_similar_var.set(False)
-                self.apply_all_filters_and_refresh()
-            return
 
-        self.is_finding_similar = True
-        self.status_label.config(text="Finding similar images...")
-        self.cancel_long_operation.clear()
-        
-        thread = threading.Thread(target=self._find_similar_images_thread_worker, args=(image_items, triggered_by_filter_toggle), daemon=True)
-        thread.start()
-
-    def _find_similar_images_thread_worker(self, image_items_to_process, triggered_by_filter_toggle=False):
-        self.image_hashes_cache.clear() 
-        item_hashes = []
-        total_images = len(image_items_to_process)
-
-        for i, item_data in enumerate(image_items_to_process):
-            if self.cancel_long_operation.is_set():
-                self.root.after(0, lambda: self.status_label.config(text="Similarity scan cancelled."))
-                self.is_finding_similar = False
-                return
-            path = item_data['path']
-            if i % 10 == 0 or i == total_images -1 :
-                self.root.after(0, lambda i=i, total=total_images: self.status_label.config(text=f"Hashing {i+1}/{total}"))
-            try:
-                img = Image.open(path)
-                img_hash = imagehash.dhash(img)
-                self.image_hashes_cache[path] = img_hash
-                item_hashes.append((path, img_hash))
-            except Exception as e:
-                print(f"Could not hash {path}: {e}")
-        
-        parent = {path: path for path, _ in item_hashes}
-        def find_set(item_path):
-            if parent[item_path] == item_path: return item_path
-            parent[item_path] = find_set(parent[item_path])
-            return parent[item_path]
-        def unite_sets(path1, path2):
-            path1_root, path2_root = find_set(path1), find_set(path2)
-            if path1_root != path2_root: parent[path2_root] = path1_root
-        
-        num_item_hashes = len(item_hashes)
-        for i in range(num_item_hashes):
-            if self.cancel_long_operation.is_set():
-                self.root.after(0, lambda: self.status_label.config(text="Similarity scan cancelled."))
-                self.is_finding_similar = False
-                return
-            if i % 10 == 0 or i == num_item_hashes -1:
-                self.root.after(0, lambda i=i, total=num_item_hashes: self.status_label.config(text=f"Comparing {i+1}/{total}"))
-            path1, hash1 = item_hashes[i]
-            for j in range(i + 1, num_item_hashes):
-                path2, hash2 = item_hashes[j]
-                if (hash1 - hash2) <= self.similarity_threshold:
-                    unite_sets(path1, path2)
-
-        groups_map = {}
-        for path, _ in item_hashes:
-            root_path = find_set(path)
-            groups_map.setdefault(root_path, set()).add(path)
-        
-        self.similar_image_groups = [group for group in groups_map.values() if len(group) > 1]
-        self.marked_similar_paths.clear()
-        for group in self.similar_image_groups:
-            self.marked_similar_paths.update(group)
-
-        self.is_finding_similar = False
-        self._similarity_scan_done_for_current_folder = True
-        msg = f"Found {len(self.similar_image_groups)} groups of similar images."
-        self.root.after(0, lambda: self.status_label.config(text=msg))
-        
-        if not triggered_by_filter_toggle:
-            self.root.after(0, lambda: messagebox.showinfo("Similarity Check Complete", msg, parent=self.root))
-        
-        self.root.after(0, self.apply_all_filters_and_refresh) 
-
-    def _refresh_all_item_visuals(self):
-        for path, item_info in self.items_in_view.items():
-            if item_info['widget'].winfo_exists():
-                style = self._get_item_style(path, item_info)
+    def _refresh_all_item_visuals(self): # Used after some operations that change item states globally
+        # Example: after a similarity scan, or if styles themselves changed.
+        for path, item_info_dict in self.items_in_view.items():
+            if item_info_dict['widget'].winfo_exists():
+                style_name = self._get_item_style(path, item_info_dict)
                 try:
-                    item_info['widget'].configure(style=style)
-                except tk.TclError as e:
-                    print(f"Error applying style {style} to {path}: {e}")
+                    item_info_dict['widget'].configure(style=style_name)
+                except tk.TclError as e_style:
+                    print(f"Error applying style {style_name} to {path}: {e_style}")
 
-    def _consolidate_media_action(self):
-        current_root_folder = self.current_folder.get()
-        if not os.path.isdir(current_root_folder) or current_root_folder == "No folder selected":
-            messagebox.showerror("Error", "Please select a valid root folder first.", parent=self.root)
-            return
+    def _get_errored_item_paths(self):
+        """Returns a list of paths for items currently marked as errored in the view."""
+        return [
+            path for path, info in self.items_in_view.items()
+            if info.get('is_error', False) and os.path.exists(path) # Ensure file still exists
+        ]
 
-        destination_folder = filedialog.askdirectory(
-            title="Select Destination Folder for All Media",
-            parent=self.root
-        )
-        if not destination_folder:
-            return 
+    # --- Entry Point Methods for Action Handlers (called by UI elements) ---
+    # These methods bridge the UI commands (often set up in ui_creator) to the
+    # more complex logic now residing in action_handlers.py.
 
-        if os.path.abspath(destination_folder).startswith(os.path.abspath(current_root_folder)) and \
-           os.path.abspath(destination_folder) != os.path.abspath(current_root_folder):
-            if os.path.realpath(destination_folder) == os.path.realpath(current_root_folder):
-                 if not messagebox.askyesno("Warning", "Destination is the same as the root folder. This will effectively do nothing but might rename files if conflicts exist. Continue?", parent=self.root):
-                     return
-            else:
-                messagebox.showerror("Error", "Destination folder cannot be inside the current root folder or its subdirectories (unless it's the root itself, which is not recommended).", parent=self.root)
-                return
+    def delete_selected_items_action_entry(self, items_to_delete_override=None, from_viewer=False):
+        # `self` (app_instance) is passed implicitly to action_handlers.handle_delete_items
+        return action_handlers.handle_delete_items(self, items_to_delete_override, from_viewer)
 
-        dialog = tk.Toplevel(self.root)
-        dialog.title("Consolidation Options")
-        dialog.transient(self.root)
-        dialog.grab_set()
-        
-        ttk.Label(dialog, text=f"Consolidate media from:\n{current_root_folder}\n\nTo destination:\n{destination_folder}\n").pack(padx=10, pady=10)
-        
-        action_type_var = tk.StringVar(value="move") 
-        ttk.Radiobutton(dialog, text="Move media (original files will be deleted)", variable=action_type_var, value="move").pack(anchor="w", padx=10)
-        ttk.Radiobutton(dialog, text="Copy media (original files will be kept)", variable=action_type_var, value="copy").pack(anchor="w", padx=10)
-        
-        media_to_consolidate_frame = ttk.LabelFrame(dialog, text="Media Types to Consolidate")
-        media_to_consolidate_frame.pack(padx=10, pady=5, fill="x")
-        consolidate_images_var = tk.BooleanVar(value=True)
-        consolidate_videos_var = tk.BooleanVar(value=True) 
-        ttk.Checkbutton(media_to_consolidate_frame, text="Images", variable=consolidate_images_var).pack(anchor="w", padx=5)
-        ttk.Checkbutton(media_to_consolidate_frame, text="Videos", variable=consolidate_videos_var).pack(anchor="w", padx=5)
+    def _undo_last_action(self): # This is directly called by menu/button
+        action_handlers.handle_undo_action(self)
 
-        ttk.Label(dialog, text="Handle filename conflicts by:").pack(anchor="w", padx=10, pady=(10,0))
-        conflict_resolution_var = tk.StringVar(value="rename") 
-        ttk.Radiobutton(dialog, text="Renaming (e.g., file.jpg -> file (1).jpg)", variable=conflict_resolution_var, value="rename").pack(anchor="w", padx=10)
-        ttk.Radiobutton(dialog, text="Skipping duplicates", variable=conflict_resolution_var, value="skip").pack(anchor="w", padx=10)
-        ttk.Radiobutton(dialog, text="Overwriting duplicates (DANGEROUS!)", variable=conflict_resolution_var, value="overwrite").pack(anchor="w", padx=10)
+    def _find_similar_images_action_entry(self, triggered_by_filter_toggle=False):
+        action_handlers.trigger_find_similar_images(self, triggered_by_filter_toggle)
 
-        def on_proceed():
-            action = action_type_var.get()
-            conflict_resolution = conflict_resolution_var.get()
-            include_images = consolidate_images_var.get()
-            include_videos = consolidate_videos_var.get()
-            dialog.destroy()
+    def _consolidate_media_action_entry(self):
+        action_handlers.prompt_and_consolidate_media(self)
 
-            if not include_images and not include_videos:
-                messagebox.showinfo("Info", "No media types selected for consolidation.", parent=self.root)
-                return
-            
-            media_types_str = []
-            if include_images: media_types_str.append("images")
-            if include_videos: media_types_str.append("videos")
-            media_types_display = " and ".join(media_types_str)
+    def _organize_media_by_date_action_entry(self):
+        action_handlers.prompt_and_organize_media_by_date(self)
 
-            warning_message = (
-                f"This will {action} ALL selected {media_types_display} from '{current_root_folder}' and its subfolders "
-                f"into '{destination_folder}'.\n"
-                "This operation can be very intensive and may take a long time.\n"
-                "Original folder structure will NOT be preserved in the destination.\n\n"
-                "ARE YOU SURE YOU WANT TO PROCEED?"
-            )
-            if not messagebox.askyesno("Confirm Consolidation", warning_message, icon='warning', parent=self.root):
-                return
+    # New entry point method:
+    def _auto_delete_similar_half_action_entry(self):
+        action_handlers.handle_auto_delete_similar_half(self)
 
-            self.status_label.config(text=f"{action.capitalize()}ing {media_types_display}...")
-            self.root.config(cursor="watch")
-            self.cancel_long_operation.clear() 
-            
-            thread = threading.Thread(
-                target=self._consolidate_media_worker,
-                args=(current_root_folder, destination_folder, action, conflict_resolution, include_images, include_videos),
-                daemon=True
-            )
-            thread.start()
+    def _delete_all_errored_action_entry(self):
+        action_handlers.handle_delete_all_errored(self)
 
-        def on_cancel():
-            dialog.destroy()
+    def _move_all_errored_action_entry(self):
+        action_handlers.handle_move_all_errored(self)
 
-        button_frame = ttk.Frame(dialog)
-        button_frame.pack(pady=10)
-        ttk.Button(button_frame, text="Proceed", command=on_proceed).pack(side=tk.LEFT, padx=5)
-        ttk.Button(button_frame, text="Cancel", command=on_cancel).pack(side=tk.LEFT, padx=5)
-        
-        dialog.update_idletasks()
-        x = self.root.winfo_x() + (self.root.winfo_width() - dialog.winfo_width()) // 2
-        y = self.root.winfo_y() + (self.root.winfo_height() - dialog.winfo_height()) // 2
-        dialog.geometry(f"+{x}+{y}")
 
-    def _consolidate_media_worker(self, root_dir, dest_dir, action_type, conflict_resolution, include_images, include_videos):
-        action_count = 0
-        skipped_count = 0
-        error_count = 0
-        processed_for_status = 0
+if __name__ == "__main__":
+    # This part is usually in main.py, but can be here for direct testing
+    if Image is None or ImageTk is None:
+         # Try a Tkinter messagebox if possible before full app init
+        try:
+            root_check = tk.Tk()
+            root_check.withdraw() # Hide the main window
+            messagebox.showerror("Critical Error", "Pillow library not found.\nPlease install it using: pip install Pillow", parent=root_check)
+            root_check.destroy()
+        except tk.TclError: # Fallback if even basic Tk fails
+            print("CRITICAL ERROR: Pillow library not found. Please install it using: pip install Pillow")
+        sys.exit(1)
 
-        found_media = []
-        for dirpath, _, filenames in os.walk(root_dir):
-            if os.path.commonpath([dirpath, dest_dir]) == os.path.abspath(dest_dir) and os.path.abspath(dirpath) != os.path.abspath(dest_dir):
-                continue
-            for filename in filenames:
-                ext_lower = os.path.splitext(filename)[1].lower()
-                is_image = ext_lower in IMAGE_EXTENSIONS
-                is_video = ext_lower in VIDEO_EXTENSIONS
-                
-                if (include_images and is_image) or (include_videos and is_video):
-                    found_media.append(os.path.join(dirpath, filename))
-        
-        total_media_to_process = len(found_media)
-        if total_media_to_process == 0:
-            self.root.after(0, lambda: self.status_label.config(text="No selected media found to consolidate."))
-            self.root.after(0, lambda: self.root.config(cursor=""))
-            self.root.after(0, lambda: messagebox.showinfo("Consolidation Complete", "No selected media types found.", parent=self.root))
-            return
-
-        for src_path in found_media:
-            if self.cancel_long_operation.is_set(): 
-                self.root.after(0, lambda: self.status_label.config(text="Consolidation cancelled."))
-                break
-            
-            processed_for_status += 1
-            self.root.after(0, lambda current=processed_for_status, total=total_media_to_process: 
-                            self.status_label.config(text=f"{action_type.capitalize()}ing: {current}/{total}"))
-            
-            if os.path.commonpath([src_path, dest_dir]) == os.path.abspath(dest_dir):
-                if os.path.dirname(src_path) == os.path.abspath(dest_dir): 
-                    skipped_count +=1 
-                    continue
-
-            filename = os.path.basename(src_path)
-            current_dest_path = os.path.join(dest_dir, filename)
-
-            if os.path.abspath(src_path) == os.path.abspath(current_dest_path):
-                skipped_count +=1
-                continue
-
-            if os.path.exists(current_dest_path):
-                if conflict_resolution == "skip":
-                    skipped_count += 1
-                    continue
-                elif conflict_resolution == "overwrite":
-                    pass 
-                elif conflict_resolution == "rename":
-                    base, ext = os.path.splitext(filename)
-                    count = 1
-                    while os.path.exists(current_dest_path):
-                        current_dest_path = os.path.join(dest_dir, f"{base} ({count}){ext}")
-                        count += 1
-            
-            try:
-                if action_type == "move":
-                    shutil.move(src_path, current_dest_path)
-                elif action_type == "copy":
-                    shutil.copy2(src_path, current_dest_path) 
-                action_count += 1
-            except Exception as e:
-                print(f"Error {action_type}ing {src_path} to {current_dest_path}: {e}")
-                error_count += 1
-            
-        self.root.after(0, lambda: self.root.config(cursor=""))
-        
-        summary_message = f"Media Consolidation Complete!\n\n"
-        summary_message += f"Successfully {action_type}d: {action_count}\n"
-        summary_message += f"Skipped (already in dest or conflict): {skipped_count}\n"
-        summary_message += f"Errors: {error_count}\n"
-        summary_message += f"Total media files found: {total_media_to_process}"
-
-        self.root.after(0, lambda msg=summary_message: self.status_label.config(text="Consolidation finished."))
-        self.root.after(0, lambda msg=summary_message: messagebox.showinfo("Consolidation Result", msg, parent=self.root))
-        
-        if os.path.isdir(self.current_folder.get()):
-            self.root.after(0, lambda: self.load_items(self.current_folder.get()))
-
-    def _get_media_date(self, file_path):
-        ext_lower = os.path.splitext(file_path)[1].lower()
-        date_to_use = None
-
-        if ext_lower in IMAGE_EXTENSIONS:
-            try:
-                img = Image.open(file_path)
-                exif_data = img._getexif() 
-
-                if exif_data:
-                    date_str = None
-                    if 36867 in exif_data: date_str = exif_data[36867] 
-                    elif 36868 in exif_data: date_str = exif_data[36868] 
-                    elif 306 in exif_data: date_str = exif_data[306] 
-                    
-                    if date_str and isinstance(date_str, str):
-                        date_str_cleaned = date_str.split('\x00')[0].strip()
-                        try:
-                            date_to_use = datetime.strptime(date_str_cleaned, '%Y:%m:%d %H:%M:%S')
-                        except ValueError:
-                            try:
-                                date_to_use = datetime.strptime(date_str_cleaned, '%Y-%m-%d %H:%M:%S')
-                            except ValueError:
-                                print(f"Could not parse EXIF date string '{date_str_cleaned}' for {file_path}")
-            except UnidentifiedImageError:
-                print(f"Cannot identify image file: {file_path}")
-            except Exception:
-                pass 
-        
-        if date_to_use is None:
-            try:
-                mtime_timestamp = os.path.getmtime(file_path)
-                date_to_use = datetime.fromtimestamp(mtime_timestamp)
-            except OSError as e:
-                print(f"Could not get file system date for {file_path}: {e}")
-        
-        return date_to_use
-
-    def _organize_media_by_date_action(self):
-        current_root_folder = self.current_folder.get()
-        if not os.path.isdir(current_root_folder) or current_root_folder == "No folder selected":
-            messagebox.showerror("Error", "Please select a valid root folder first.", parent=self.root)
-            return
-
-        destination_base_folder = filedialog.askdirectory(
-            title="Select Base Destination Folder for Dated Subfolders",
-            parent=self.root
-        )
-        if not destination_base_folder:
-            return
-
-        if os.path.abspath(destination_base_folder).startswith(os.path.abspath(current_root_folder)) and \
-           os.path.abspath(destination_base_folder) != os.path.abspath(current_root_folder):
-            if os.path.realpath(destination_base_folder) == os.path.realpath(current_root_folder):
-                 if not messagebox.askyesno("Warning", "Destination is the same as the root folder. This will create dated subfolders within the root. Continue?", parent=self.root):
-                     return
-            else:
-                messagebox.showerror("Error", "Base destination folder cannot be inside the current root folder (unless it's the root itself).", parent=self.root)
-                return
-
-        dialog = tk.Toplevel(self.root)
-        dialog.title("Date Organization Options")
-        dialog.transient(self.root)
-        dialog.grab_set()
-
-        ttk.Label(dialog, text=f"Organize media from:\n{current_root_folder}\n\nInto dated subfolders inside:\n{destination_base_folder}\n").pack(padx=10, pady=10)
-
-        action_type_var = tk.StringVar(value="move")
-        ttk.Radiobutton(dialog, text="Move media (original files will be deleted)", variable=action_type_var, value="move").pack(anchor="w", padx=10)
-        ttk.Radiobutton(dialog, text="Copy media (original files will be kept)", variable=action_type_var, value="copy").pack(anchor="w", padx=10)
-        
-        media_to_organize_frame = ttk.LabelFrame(dialog, text="Media Types to Organize")
-        media_to_organize_frame.pack(padx=10, pady=5, fill="x")
-        organize_images_var = tk.BooleanVar(value=True)
-        organize_videos_var = tk.BooleanVar(value=True) 
-        ttk.Checkbutton(media_to_organize_frame, text="Images", variable=organize_images_var).pack(anchor="w", padx=5)
-        ttk.Checkbutton(media_to_organize_frame, text="Videos", variable=organize_videos_var).pack(anchor="w", padx=5)
-
-        ttk.Label(dialog, text="Handle filename conflicts (for new names) by:").pack(anchor="w", padx=10, pady=(10,0))
-        conflict_resolution_var = tk.StringVar(value="rename_sequential")
-        ttk.Radiobutton(dialog, text="Renaming with sequence (e.g., DD-HHMMSS_seq_Orig.ext)", variable=conflict_resolution_var, value="rename_sequential").pack(anchor="w", padx=10)
-        ttk.Radiobutton(dialog, text="Skipping duplicates", variable=conflict_resolution_var, value="skip").pack(anchor="w", padx=10)
-
-        def on_proceed():
-            action = action_type_var.get()
-            conflict_resolution = conflict_resolution_var.get()
-            include_images = organize_images_var.get()
-            include_videos = organize_videos_var.get()
-            dialog.destroy()
-
-            if not include_images and not include_videos:
-                messagebox.showinfo("Info", "No media types selected for organization.", parent=self.root)
-                return
-            
-            media_types_str = []
-            if include_images: media_types_str.append("images")
-            if include_videos: media_types_str.append("videos")
-            media_types_display = " and ".join(media_types_str)
-
-            warning_message = (
-                f"This will {action} ALL selected {media_types_display} from '{current_root_folder}' and its subfolders "
-                f"into dated subfolders (Year/Month) inside '{destination_base_folder}'.\n"
-                f"Files will be renamed (e.g., DD-HHMMSS_OriginalName_seq.ext).\n"
-                "This operation can be very intensive.\n\n"
-                "ARE YOU SURE YOU WANT TO PROCEED?"
-            )
-            if not messagebox.askyesno("Confirm Date Organization", warning_message, icon='warning', parent=self.root):
-                return
-
-            self.status_label.config(text=f"{action.capitalize()}ing & organizing {media_types_display}...")
-            self.root.config(cursor="watch")
-            self.cancel_long_operation.clear()
-
-            thread = threading.Thread(
-                target=self._organize_media_by_date_worker,
-                args=(current_root_folder, destination_base_folder, action, conflict_resolution, include_images, include_videos),
-                daemon=True
-            )
-            thread.start()
-
-        def on_cancel():
-            dialog.destroy()
-
-        button_frame = ttk.Frame(dialog)
-        button_frame.pack(pady=10)
-        ttk.Button(button_frame, text="Proceed", command=on_proceed).pack(side=tk.LEFT, padx=5)
-        ttk.Button(button_frame, text="Cancel", command=on_cancel).pack(side=tk.LEFT, padx=5)
-        
-        dialog.update_idletasks()
-        x = self.root.winfo_x() + (self.root.winfo_width() - dialog.winfo_width()) // 2
-        y = self.root.winfo_y() + (self.root.winfo_height() - dialog.winfo_height()) // 2
-        dialog.geometry(f"+{x}+{y}")
-
-    def _organize_media_by_date_worker(self, root_dir, base_dest_dir, action_type, conflict_resolution, include_images, include_videos):
-        action_count = 0
-        skipped_count = 0
-        error_count = 0
-        unknown_date_count = 0
-        processed_for_status = 0
-
-        found_media = []
-        for dirpath, _, filenames in os.walk(root_dir):
-            if os.path.commonpath([dirpath, base_dest_dir]) == os.path.abspath(base_dest_dir) and \
-               os.path.abspath(dirpath) != os.path.abspath(base_dest_dir):
-                continue
-
-            for filename in filenames:
-                ext_lower = os.path.splitext(filename)[1].lower()
-                is_image = ext_lower in IMAGE_EXTENSIONS
-                is_video = ext_lower in VIDEO_EXTENSIONS
-                if (include_images and is_image) or (include_videos and is_video):
-                    found_media.append(os.path.join(dirpath, filename))
-        
-        total_media_to_process = len(found_media)
-        if total_media_to_process == 0:
-            self.root.after(0, lambda: self.status_label.config(text="No selected media found to organize."))
-            self.root.after(0, lambda: self.root.config(cursor=""))
-            self.root.after(0, lambda: messagebox.showinfo("Organization Complete", "No selected media found.", parent=self.root))
-            return
-
-        for src_path in found_media:
-            if self.cancel_long_operation.is_set():
-                self.root.after(0, lambda: self.status_label.config(text="Organization cancelled."))
-                break
-            
-            processed_for_status += 1
-            self.root.after(0, lambda current=processed_for_status, total=total_media_to_process: 
-                            self.status_label.config(text=f"Organizing: {current}/{total}"))
-
-            media_date_dt = self._get_media_date(src_path) 
-            
-            if not media_date_dt:
-                unknown_date_count += 1
-                unknown_folder = os.path.join(base_dest_dir, "Unknown_Date")
-                os.makedirs(unknown_folder, exist_ok=True)
-                filename_original = os.path.basename(src_path)
-                dest_path_unknown = os.path.join(unknown_folder, filename_original)
-                
-                if os.path.realpath(src_path) == os.path.realpath(dest_path_unknown):
-                    skipped_count +=1; continue
-
-                if os.path.exists(dest_path_unknown):
-                    if conflict_resolution == "skip": skipped_count += 1; continue
-                    elif conflict_resolution == "rename_sequential": 
-                        base, ext = os.path.splitext(filename_original)
-                        count = 1
-                        while os.path.exists(dest_path_unknown):
-                            dest_path_unknown = os.path.join(unknown_folder, f"{base}_{count}{ext}") 
-                            count += 1
-                try:
-                    if action_type == "move": shutil.move(src_path, dest_path_unknown)
-                    else: shutil.copy2(src_path, dest_path_unknown)
-                    action_count +=1
-                except Exception as e: error_count +=1; print(f"Error for unknown date file {src_path}: {e}")
-                continue
-
-            year_str = media_date_dt.strftime("%Y")
-            month_str = media_date_dt.strftime("%m") 
-            day_str = media_date_dt.strftime("%d")   
-            time_str = media_date_dt.strftime("%H%M%S") 
-
-            target_subfolder_path = os.path.join(base_dest_dir, year_str, month_str)
-            os.makedirs(target_subfolder_path, exist_ok=True)
-            
-            original_filename_base, original_ext = os.path.splitext(os.path.basename(src_path))
-            safe_original_name = "".join(c if c.isalnum() or c in ('_', '-') else '_' for c in original_filename_base)
-            safe_original_name = safe_original_name[:30] 
-
-            new_filename_base = f"{day_str}-{time_str}_{safe_original_name}"
-            
-            seq_count = 0
-            dest_path = os.path.join(target_subfolder_path, f"{new_filename_base}{original_ext}")
-            
-            if os.path.realpath(src_path) == os.path.realpath(dest_path):
-                skipped_count +=1
-                continue
-
-            if os.path.exists(dest_path):
-                if conflict_resolution == "skip":
-                    skipped_count += 1
-                    continue
-                elif conflict_resolution == "rename_sequential":
-                    seq_count = 1
-                    while os.path.exists(dest_path):
-                        dest_path = os.path.join(target_subfolder_path, f"{new_filename_base}_{seq_count}{original_ext}")
-                        seq_count += 1
-            
-            try:
-                if action_type == "move":
-                    shutil.move(src_path, dest_path)
-                elif action_type == "copy":
-                    shutil.copy2(src_path, dest_path)
-                action_count += 1
-            except Exception as e:
-                print(f"Error {action_type}ing {src_path} to {dest_path}: {e}")
-                error_count += 1
-
-        self.root.after(0, lambda: self.root.config(cursor=""))
-        
-        summary_message = f"Date Organization Complete!\n\n"
-        summary_message += f"Successfully {action_type}d: {action_count}\n"
-        summary_message += f"Skipped (conflict/same path): {skipped_count}\n"
-        summary_message += f"Media with unknown date (moved to 'Unknown_Date'): {unknown_date_count}\n"
-        summary_message += f"Errors: {error_count}\n"
-        summary_message += f"Total media files found: {total_media_to_process}"
-
-        self.root.after(0, lambda msg=summary_message: self.status_label.config(text="Organization finished."))
-        self.root.after(0, lambda msg=summary_message: messagebox.showinfo("Organization Result", msg, parent=self.root))
-        
-        if os.path.isdir(self.current_folder.get()):
-            self.root.after(0, lambda: self.load_items(self.current_folder.get()))
+    root_app = tk.Tk()
+    app_instance = PhotoVideoManagerApp(root_app)
+    root_app.mainloop()
