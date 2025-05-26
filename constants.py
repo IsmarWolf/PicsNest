@@ -39,7 +39,7 @@ def get_current_accent_color():
 PICSNEST_SELECTED_BG = None # Will be set by get_current_accent_color() in styles
 PICSNEST_SIMILAR_BG = PICSNEST_ACCENT_YELLOW
 PICSNEST_ERROR_BG = PICSNEST_ACCENT_RED
-PICSNEST_FOLDER_REPRESENTATION_BG = PICSNEST_BG_MEDIUM
+PICSNEST_FOLDER_REPRESENTATION_BG = PICSNEST_BG_MEDIUM # Default BG for folders if no custom color
 PICSNEST_ITEM_PLACEHOLDER_BG = PICSNEST_BG_MEDIUM
 PICSNEST_ITEM_LOADED_BG = PICSNEST_BG_MEDIUM
 
@@ -56,6 +56,7 @@ IMAGE_VIEWER_BG = PICSNEST_VIEWER_BG
 # --- Configuration Paths & Names ---
 THEME_SETTINGS_FILENAME = "theme_settings.json"
 FOLDER_THUMB_DB_FILENAME = "folder_thumbs.json"
+CUSTOM_FOLDER_ICONS_DIR_NAME = ".custom_folder_icons" # New directory for storing custom icons
 TRASH_DIR_NAME = ".app_trash_v3" # Changed to v3 to avoid conflict if user had v2
 
 # --- Trash Settings ---

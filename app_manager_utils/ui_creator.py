@@ -272,8 +272,11 @@ def apply_app_styles(app_instance):
     style.configure("PicsNest.Error.TFrame", background=PICSNEST_ERROR_BG, bordercolor=PICSNEST_TEXT_LIGHT, borderwidth=1, **item_frame_common_dict)
 
     style.configure("PicsNest.ItemThumb.TLabel", background=PICSNEST_BG_MEDIUM, foreground=PICSNEST_TEXT_LIGHT)
-    style.configure("PicsNest.ItemName.TLabel", background="parent", foreground=PICSNEST_TEXT_LIGHT, font=('Segoe UI', 9)) # Font size increased
-    style.configure("PicsNest.ErrorIcon.TLabel", background="parent", foreground=PICSNEST_ACCENT_RED)
+    style.configure("PicsNest.ItemName.TLabel", 
+                    background="parent", # THIS IS IMPORTANT! It should inherit from widget_frame
+                    foreground=PICSNEST_TEXT_LIGHT, 
+                    font=('Segoe UI', 9), # Ensure font size is reasonable
+                    anchor="center") # ttk.Label uses anchor, not justify for single line. justify is for multiline via wraplength.    style.configure("PicsNest.ErrorIcon.TLabel", background="parent", foreground=PICSNEST_ACCENT_RED)
     style.configure("PicsNest.PlaceholderIcon.TLabel", background="parent", foreground=PICSNEST_TEXT_LIGHT)
 
     style.configure("PicsNest.Preview.TLabelframe", background=PICSNEST_BG_DARK, relief=tk.SOLID, borderwidth=1)
