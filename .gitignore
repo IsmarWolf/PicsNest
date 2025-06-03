@@ -33,9 +33,7 @@ theme_settings.json # User's theme settings
 # picsnest_logo.png
 # picsnest_logo_large.png
 
-# If you create executables/installers
-*.exe
-*.dmg
-*.msi
-*.deb
-*.rpm
+# Executables/installers
+dist/*.exe
+build/*.exe
+!installer/PicsNest_Setup.exe
