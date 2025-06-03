@@ -1,3 +1,4 @@
 *.7z filter=lfs diff=lfs merge=lfs -text
 PicsNest_Setup.exe filter=lfs diff=lfs merge=lfs -text
 installer/PicsNest_Setup.exe filter=lfs diff=lfs merge=lfs -text
+installer/PicsNest_Setup.zip filter=lfs diff=lfs merge=lfs -text
