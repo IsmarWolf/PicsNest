@@ -1,65 +1,82 @@
-# PicsNest
+# PicsNest 📸
 
-A modern image and video management application built with Python and Tkinter.
+Bem-vindo ao PicsNest! Um gerenciador moderno de imagens e vídeos que desenvolvi com muito carinho usando Python e Tkinter.
 
-## Features
+## 📥 Download
 
-- Browse and manage images and videos in a grid view
-- Preview images and videos
-- Navigate through folders easily
-- Delete files with undo functionality
-- Multi-select support
-- Image viewing with zoom and navigation
-- Video playback support (requires VLC)
+⬇️ [Baixe a Última Versão](https://github.com/IsmarWolf/PicsNest/releases/latest)
 
-## Requirements
+É super fácil começar! Apenas baixe o PicsNest_Setup.exe e execute para instalar!
 
-- Python 3.8 or higher
-- Pillow (PIL) library
-- python-vlc (optional, for video playback)
+## ✨ Funcionalidades
 
-## Installation
+- 🖼️ Visualização de imagens e vídeos em grade
+- 🔍 Pré-visualização rápida e intuitiva
+- 📁 Navegação super fácil entre pastas
+- 🗑️ Delete arquivos com funcionalidade de desfazer
+- ✅ Suporte à seleção múltipla
+- 🔎 Visualização de imagens com zoom e navegação
+- 🎥 Suporte à reprodução de vídeos (necessário VLC)
 
-1. Clone this repository:
+## 🛠️ Requisitos
+
+- Python 3.8 ou superior
+- Biblioteca Pillow (PIL)
+- python-vlc (opcional, para reprodução de vídeos)
+
+## 💻 Instalação
+
+1. Clone o repositório:
 ```powershell
 git clone https://github.com/yourusername/PicsNest.git
 cd PicsNest
 ```
 
-2. Create a virtual environment (recommended):
+2. Crie um ambiente virtual (recomendado):
 ```powershell
 python -m venv venv
 .\venv\Scripts\activate
 ```
 
-3. Install required packages:
+3. Instale os pacotes necessários:
 ```powershell
 pip install -r requirements.txt
 ```
 
-## Usage
+## 🚀 Como Usar
 
-Run the application:
+Execute o aplicativo:
 ```powershell
 python main.py
 ```
 
-## Building from Source
+## 🔧 Compilando da Fonte
 
-To create a standalone executable:
+Para criar um executável standalone:
 
-1. Install PyInstaller:
+1. Instale o PyInstaller:
 ```powershell
 pip install pyinstaller
 ```
 
-2. Build the executable:
+2. Compile o executável:
 ```powershell
 pyinstaller PicsNest.spec
 ```
 
-The executable will be created in the `dist` folder.
+O executável será criado na pasta `dist`.
 
-## License
+## 📝 Licença
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+Este projeto está licenciado sob a Licença MIT - veja o arquivo LICENSE para mais detalhes.
+
+## 💖 Contribuições
+
+Adoraria receber sua ajuda para melhorar o PicsNest! Sinta-se à vontade para:
+- Reportar bugs
+- Sugerir novas funcionalidades
+- Enviar pull requests
+
+## ✉️ Contato
+
+Tem alguma dúvida ou sugestão? Entre em contato comigo!
